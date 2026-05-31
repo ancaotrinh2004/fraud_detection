@@ -246,9 +246,9 @@ Three Multibranch Jenkins pipelines with changeset detection. Each pipeline runs
 
 | Pipeline | Jenkinsfile | Triggers on |
 |---|---|---|
-| `fraud-track-a` | `jenkins/Jenkinsfile.track_a` | `src/pipelines/**` · `dags/**` · `config/**` · `infra/helm/airflow/**` |
-| `fraud-track-b` | `jenkins/Jenkinsfile.track_b` | `src/inference/**` · `infra/docker/inference/**` · `infra/k8s/fraud-inference.yaml` |
-| `fraud-track-c` | `jenkins/Jenkinsfile.track_c` | `infra/helm/**` · `infra/k8s/**` |
+| `fraud-track-a` | `jenkins/Jenkinsfile.data_ml_pipeline` | `src/pipelines/**` · `dags/**` · `config/**` · `infra/helm/airflow/**` |
+| `fraud-track-b` | `jenkins/Jenkinsfile.inference_service` | `src/inference/**` · `infra/docker/inference/**` · `infra/k8s/fraud-inference.yaml` |
+| `fraud-track-c` | `jenkins/Jenkinsfile.IaC` | `infra/helm/**` · `infra/k8s/**` |
 
 Manual full deploy: trigger on `main` with no code change, or use the `FORCE_DEPLOY` parameter.
 
