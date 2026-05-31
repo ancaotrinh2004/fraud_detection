@@ -1,0 +1,190 @@
+# infra/helm/monitoring/values.yaml
+#
+# kube-prometheus-stack overrides for the fraud-detection Kind cluster.
+# Only non-default values are listed. For full reference see:
+#   helm show values prometheus-community/kube-prometheus-stack
+#
+# Deploy:
+#   helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+#   helm repo update
+#   helm upgrade --install kube-prom prometheus-community/kube-prometheus-stack \
+#     -n monitoring --create-namespace \
+#     -f infra/helm/monitoring/values.yaml
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Grafana
+# ─────────────────────────────────────────────────────────────────────────────
+grafana:
+  adminPassword: fraud-grafana-2025   # change in production
+
+  # ── Grafana 13 stability fix for local Kind cluster ─────────────────────────
+  # Root cause 1: Grafana 13 tries to download 5 bundled plugins from grafana.com
+  # on first start (~60s timeout in air-gapped Kind).
+  # Root cause 2: Grafana 13 enables K8s API backend (kubernetesDashboards,
+  # grafana-apiserver) by default — background goroutines call K8s API and block
+  # on context deadline exceeded → HTTP server unresponsive → readiness probe fails.
+  # Root cause 3: 256Mi memory limit too low for Grafana 13 + Bleve search index.
+  #
+  # Fix: disable K8s storage features, extend probe delays, increase memory.
+  grafana.ini:
+    analytics:
+      check_for_updates: false
+      check_for_plugin_updates: false
+      reporting_enabled: false
+    feature_toggles:
+      # disable K8s API backend for dashboards and secure values — not needed
+      # in a single-node Kind cluster, causes context deadline exceeded loops
+      kubernetesDashboards: false
+      kubernetesClientDashboardsFolders: false
+      unifiedStorageSearch: false
+
+  livenessProbe:
+    httpGet:
+      path: /api/health
+      port: grafana
+    initialDelaySeconds: 180
+    timeoutSeconds: 30
+    failureThreshold: 10
+
+  readinessProbe:
+    httpGet:
+      path: /api/health
+      port: grafana
+    initialDelaySeconds: 60
+    timeoutSeconds: 10
+    periodSeconds: 15
+    failureThreshold: 6
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 200m
+      memory: 512Mi
+
+  # ── Extra datasource: fraud PostgreSQL (Gold layer tables) ─────────────────
+  # ref: https://grafana.com/docs/grafana/latest/administration/provisioning/#datasources
+  additionalDataSources:
+    - name: PostgreSQL-FraudDB
+      uid: postgresql-frauddb
+      type: grafana-postgresql-datasource
+      access: proxy
+      url: fraud-postgres-postgresql.fraud-infra.svc.cluster.local:5432
+      user: fraud_user
+      secureJsonData:
+        password: fraud_pass
+      jsonData:
+        database: fraud_detection
+        sslmode: disable
+        postgresVersion: 1800    # PostgreSQL 18
+        timescaledb: false
+      orgId: 1
+      version: 1
+      editable: true
+
+  # sidecar.dashboards defaults are already correct for us:
+  #   enabled: true | label: grafana_dashboard | labelValue: "1" | searchNamespace: ALL
+  # No override needed — Grafana will auto-load any ConfigMap in any namespace
+  # that carries the label grafana_dashboard=1.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Prometheus
+# ─────────────────────────────────────────────────────────────────────────────
+prometheus:
+  prometheusSpec:
+    # Retain 15 days to cover the 4-month simulated dataset
+    retention: 15d
+
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+
+    # Persist TSDB across pod restarts (Kind supports local-path provisioner)
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 5Gi
+
+    # ── Extra scrape targets not managed by ServiceMonitors ─────────────────
+    # ref: https://prometheus.io/docs/prometheus/latest/configuration/configuration/#scrape_config
+    additionalScrapeConfigs:
+
+      # 1. Airflow StatsD exporter — already running in the airflow namespace,
+      #    exposes Prometheus-format metrics on port 9102.
+      - job_name: airflow-statsd
+        scrape_interval: 30s
+        static_configs:
+          - targets:
+              - airflow-statsd.airflow.svc.cluster.local:9102
+
+      # 2. MinIO cluster metrics (v3 API — no auth required in MinIO 2024.x+).
+      - job_name: minio
+        scrape_interval: 60s
+        metrics_path: /minio/metrics/v3/cluster
+        static_configs:
+          - targets:
+              - fraud-minio.fraud-infra.svc.cluster.local:9000
+
+      # 3. Pushgateway — receives one-off metrics pushed by batch pipelines (Level 2).
+      #    Deployed via infra/k8s/pushgateway.yaml in the monitoring namespace.
+      #    honor_labels preserves the job/instance labels set by the pusher.
+      - job_name: pushgateway
+        scrape_interval: 15s
+        honor_labels: true
+        static_configs:
+          - targets:
+              - pushgateway.monitoring.svc.cluster.local:9091
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Alertmanager — keep minimal, no external routing needed for coursework
+# ─────────────────────────────────────────────────────────────────────────────
+alertmanager:
+  alertmanagerSpec:
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 100m
+        memory: 128Mi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# kube-state-metrics and node-exporter — trim resources for Kind
+# ─────────────────────────────────────────────────────────────────────────────
+kube-state-metrics:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+
+nodeExporter:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Prometheus Operator
+# ─────────────────────────────────────────────────────────────────────────────
+prometheusOperator:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi

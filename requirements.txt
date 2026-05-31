@@ -1,0 +1,19 @@
+# Local development dependencies (data generation, notebooks)
+pandas
+numpy
+pyyaml
+pyarrow
+fastparquet
+tqdm
+boto3
+acryl-datahub[datahub-rest]
+psycopg2
+duckdb
+sqlalchemy
+prometheus_client
+pytest 
+scikit-learn 
+xgboost 
+fastapi
+uvicorn
+prometheus-fastapi-instrumentator

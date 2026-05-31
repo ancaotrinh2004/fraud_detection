@@ -1,0 +1,77 @@
+# DataHub core services for kind-fraud-detection
+# Prerequisites: opensearch, kafka, mysql (deployed via prerequisites chart)
+
+datahub-gms:
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      memory: 1500Mi
+
+datahub-frontend:
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 512Mi
+    limits:
+      memory: 1Gi
+
+datahub-mae-consumer:
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+
+datahub-mce-consumer:
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+
+datahub-actions:
+  enabled: false
+
+acryl-datahub-actions:
+  enabled: false
+
+global:
+  graph_service_impl: elasticsearch
+  datahub_analytics_enabled: false
+
+  elasticsearch:
+    host: "opensearch-cluster-master"
+    port: "9200"
+    useSSL: "false"
+    # OpenSearch is API-compatible with ES
+    skipCheckingElasticSearchHealth: false
+
+  kafka:
+    bootstrap:
+      server: "prerequisites-kafka:9092"
+    schemaregistry:
+      url: "http://prerequisites-schema-registry:8081"
+
+  sql:
+    datasource:
+      host: "prerequisites-mysql:3306"
+      hostForMysqlClient: "prerequisites-mysql"
+      port: "3306"
+      url: "jdbc:mysql://prerequisites-mysql:3306/datahub?verifyServerCertificate=false&useSSL=true&useUnicode=yes&characterEncoding=UTF-8&enabledTLSProtocols=TLSv1.2"
+      driver: "com.mysql.cj.jdbc.Driver"
+      username: "datahub"
+      password:
+        secretRef: datahub-mysql-secrets
+        secretKey: mysql-password
+
+  datahub:
+    metadata_service_authentication:
+      enabled: false

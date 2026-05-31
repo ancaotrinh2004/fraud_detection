@@ -1,0 +1,441 @@
+// Track B — Inference Service
+//
+// Changeset logic (auto-detected):
+//   src/inference/**  or infra/docker/inference/**  → rebuild + push image → patch InferenceService
+//   infra/k8s/fraud-inference.yaml                  → kubectl apply only (no image rebuild)
+//
+// Manual trigger:
+//   - Trigger on main with no code change → all CD stages run automatically (empty changeset detected)
+//   - FORCE_DEPLOY=true → same effect, works on any branch
+
+pipeline {
+    agent {
+        kubernetes {
+            defaultContainer 'agent'
+            yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  serviceAccountName: default
+  containers:
+  - name: agent
+    image: ancaotrinh/jenkins:latest
+    imagePullPolicy: Always
+    command: [cat]
+    tty: true
+    env:
+    - name: DOCKER_HOST
+      value: tcp://localhost:2376
+    - name: DOCKER_TLS_CERTDIR
+      value: ""
+  - name: dind
+    image: docker:27-dind
+    securityContext:
+      privileged: true
+    env:
+    - name: DOCKER_TLS_CERTDIR
+      value: ""
+    volumeMounts:
+    - name: docker-storage
+      mountPath: /var/lib/docker
+  volumes:
+  - name: docker-storage
+    emptyDir: {}
+"""
+        }
+    }
+
+    options {
+        timeout(time: 35, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        skipDefaultCheckout()
+    }
+
+    parameters {
+        booleanParam(
+            name: 'FORCE_DEPLOY',
+            defaultValue: false,
+            description: 'Force all CD stages — use for manual deploy or first-time cluster setup'
+        )
+    }
+
+    environment {
+        PYTHONPATH   = "${WORKSPACE}"
+        PIP_QUIET    = "1"
+        IMAGE_REPO   = "ancaotrinh/fraud-inference"
+        INFERENCE_NS = "fraud-infra"
+        ISVC_NAME    = "fraud"
+    }
+
+    stages {
+
+        // ── Checkout ─────────────────────────────────────────────────────────────
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.SHORT_COMMIT = sh(
+                        script: 'git rev-parse --short HEAD',
+                        returnStdout: true
+                    ).trim()
+                    env.IMAGE_TAG = "${env.IMAGE_REPO}:${env.SHORT_COMMIT}"
+
+                    def isManualMain = (env.BRANCH_NAME == 'main' &&
+                                        currentBuild.changeSets.isEmpty())
+                    env.RUN_DEPLOY = (params.FORCE_DEPLOY || isManualMain).toString()
+
+                    echo "Commit    : ${env.SHORT_COMMIT}"
+                    echo "Image     : ${env.IMAGE_TAG}"
+                    echo "Branch    : ${env.BRANCH_NAME}"
+                    echo "RUN_DEPLOY: ${env.RUN_DEPLOY}" +
+                         (params.FORCE_DEPLOY ? " (FORCE_DEPLOY param)"    :
+                          isManualMain        ? " (manual trigger on main)" : "")
+                }
+            }
+        }
+
+        // ── CI — lint & tests ─────────────────────────────────────────────────────
+        stage('Install Dependencies') {
+            when {
+                anyOf {
+                    changeset "src/**"
+                    changeset "tests/**"
+                    expression { env.RUN_DEPLOY == 'true' }
+                }
+            }
+            steps {
+                sh '''
+                    python3 -m venv .ci-venv
+                    .ci-venv/bin/pip install --upgrade pip
+                    .ci-venv/bin/pip install \
+                        ruff \
+                        pytest pytest-cov \
+                        numpy pandas scikit-learn xgboost \
+                        fastapi httpx pydantic uvicorn \
+                        sqlalchemy boto3 pyyaml \
+                        prometheus-fastapi-instrumentator
+                '''
+            }
+        }
+
+        stage('Lint') {
+            when {
+                anyOf {
+                    changeset "src/inference/**"
+                    changeset "src/pipelines/**"
+                    expression { env.RUN_DEPLOY == 'true' }
+                }
+            }
+            steps {
+                sh '.ci-venv/bin/ruff check src/inference/ src/pipelines/ --output-format=github'
+            }
+        }
+
+        stage('Unit Tests') {
+            when {
+                anyOf {
+                    changeset "src/**"
+                    changeset "tests/unit/**"
+                    expression { env.RUN_DEPLOY == 'true' }
+                }
+            }
+            steps {
+                sh '''
+                    .ci-venv/bin/pytest tests/unit/ \
+                        -v --tb=short \
+                        --junitxml=test-results-unit.xml \
+                        --cov=src --cov-report=xml:coverage.xml
+                '''
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true, testResults: 'test-results-unit.xml'
+                }
+            }
+        }
+
+        stage('API Contract Tests') {
+            when {
+                anyOf {
+                    changeset "src/inference/**"
+                    changeset "tests/integration/test_inference_contract.py"
+                    expression { env.RUN_DEPLOY == 'true' }
+                }
+            }
+            steps {
+                sh '''
+                    .ci-venv/bin/pytest tests/integration/test_inference_contract.py \
+                        -v --tb=short \
+                        --junitxml=test-results-contract.xml
+                '''
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true, testResults: 'test-results-contract.xml'
+                }
+            }
+        }
+
+        stage('Load Test — p95 < 500ms') {
+            when {
+                anyOf {
+                    changeset "src/inference/**"
+                    expression { env.RUN_DEPLOY == 'true' }
+                }
+            }
+            steps {
+                sh '''
+                    .ci-venv/bin/python - <<'PYEOF'
+import time, statistics
+from unittest.mock import patch, MagicMock
+import numpy as np
+
+with patch("src.inference.server._load_model"), \
+     patch("src.inference.server._get_engine"):
+    from fastapi.testclient import TestClient
+    import src.inference.server as srv
+
+mock_model = MagicMock()
+mock_model.predict_proba.return_value = np.array([[0.95, 0.05]])
+
+from src.pipelines.ml.services import ModelArtifact, FEATURE_COLS
+mock_artifact = ModelArtifact(
+    model=mock_model,
+    feature_cols=FEATURE_COLS,
+    model_version="v_load_test",
+    metrics={"pr_auc": 0.85},
+)
+
+PAYLOAD = {
+    "instances": [{"customer_id": "C0000001", "txn_amount": 150.0, "txn_hour": 14}]
+}
+
+latencies_ms = []
+with patch.object(srv, "_artifact", mock_artifact), \
+     patch.object(srv, "_fetch_features", return_value={c: 0.0 for c in FEATURE_COLS}):
+    client = TestClient(srv.app, raise_server_exceptions=True)
+    for _ in range(100):
+        t0 = time.perf_counter()
+        r = client.post("/v1/models/fraud:predict", json=PAYLOAD)
+        latencies_ms.append((time.perf_counter() - t0) * 1000)
+        assert r.status_code == 200, f"Unexpected status {r.status_code}"
+
+p95 = statistics.quantiles(latencies_ms, n=100)[94]
+p50 = statistics.median(latencies_ms)
+print(f"Load test (100 req): p50={p50:.1f}ms  p95={p95:.1f}ms")
+if p95 > 500:
+    raise SystemExit(f"p95 {p95:.1f}ms exceeds SLA 500ms")
+print("Load test passed")
+PYEOF
+                '''
+            }
+        }
+
+        // ── CD — Build & push ─────────────────────────────────────────────────────
+        stage('Build Inference Image') {
+            when {
+                allOf {
+                    branch 'main'
+                    anyOf {
+                        changeset "src/inference/**"
+                        changeset "infra/docker/inference/**"
+                        expression { env.RUN_DEPLOY == 'true' }
+                    }
+                }
+            }
+            steps {
+                sh """
+                    docker build --no-cache \\
+                        -f infra/docker/inference/Dockerfile \\
+                        -t ${env.IMAGE_TAG} \\
+                        -t ${env.IMAGE_REPO}:latest \\
+                        .
+                """
+            }
+        }
+
+        stage('Push to Docker Hub') {
+            when {
+                allOf {
+                    branch 'main'
+                    anyOf {
+                        changeset "src/inference/**"
+                        changeset "infra/docker/inference/**"
+                        expression { env.RUN_DEPLOY == 'true' }
+                    }
+                }
+            }
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'dockerhub-token',
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
+                    sh """
+                        echo "${DOCKER_PASS}" | docker login -u "${DOCKER_USER}" --password-stdin
+                        docker push ${env.IMAGE_TAG}
+                        docker push ${env.IMAGE_REPO}:latest
+                        docker logout
+                    """
+                }
+            }
+        }
+
+        // ── CD — Patch ISVC image ─────────────────────────────────────────────────
+        stage('Patch InferenceService Image') {
+            when {
+                allOf {
+                    branch 'main'
+                    anyOf {
+                        changeset "src/inference/**"
+                        changeset "infra/docker/inference/**"
+                        expression { env.RUN_DEPLOY == 'true' }
+                    }
+                }
+            }
+            steps {
+                sh """
+                    kubectl patch inferenceservice ${env.ISVC_NAME} \\
+                        -n ${env.INFERENCE_NS} \\
+                        --type=json \\
+                        -p='[{
+                            "op": "replace",
+                            "path": "/spec/predictor/containers/0/image",
+                            "value": "${env.IMAGE_TAG}"
+                        }]'
+                """
+            }
+        }
+
+        // ── CD — Apply manifest only (spec changes, no new image) ─────────────────
+        stage('Apply InferenceService Manifest') {
+            when {
+                allOf {
+                    branch 'main'
+                    anyOf {
+                        changeset "infra/k8s/fraud-inference.yaml"
+                        expression { env.RUN_DEPLOY == 'true' }
+                    }
+                    not { changeset "src/inference/**" }
+                    not { changeset "infra/docker/inference/**" }
+                }
+            }
+            steps {
+                sh "kubectl apply -f infra/k8s/fraud-inference.yaml"
+            }
+        }
+
+        // ── CD — Wait ready + smoke test ──────────────────────────────────────────
+        stage('Wait for InferenceService Ready') {
+            when {
+                allOf {
+                    branch 'main'
+                    anyOf {
+                        changeset "src/inference/**"
+                        changeset "infra/docker/inference/**"
+                        changeset "infra/k8s/fraud-inference.yaml"
+                        expression { env.RUN_DEPLOY == 'true' }
+                    }
+                }
+            }
+            steps {
+                sh """
+                    echo "Waiting for InferenceService to become ready..."
+                    for i in \$(seq 1 30); do
+                        READY=\$(kubectl get inferenceservice ${env.ISVC_NAME} \\
+                            -n ${env.INFERENCE_NS} \\
+                            -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+                        echo "  Attempt \$i/30: Ready=\$READY"
+                        if [ "\$READY" = "True" ]; then
+                            echo "InferenceService is ready"
+                            break
+                        fi
+                        if [ \$i -eq 30 ]; then
+                            echo "Timeout: InferenceService not ready after 5m"
+                            kubectl describe inferenceservice ${env.ISVC_NAME} -n ${env.INFERENCE_NS}
+                            exit 1
+                        fi
+                        sleep 10
+                    done
+                """
+            }
+        }
+
+        stage('Smoke Test') {
+            when {
+                allOf {
+                    branch 'main'
+                    anyOf {
+                        changeset "src/inference/**"
+                        changeset "infra/docker/inference/**"
+                        changeset "infra/k8s/fraud-inference.yaml"
+                        expression { env.RUN_DEPLOY == 'true' }
+                    }
+                }
+            }
+            steps {
+                sh """
+                    POD=\$(kubectl get pod -n ${env.INFERENCE_NS} \\
+                        -l serving.knative.dev/service=fraud-predictor \\
+                        -o name | head -1)
+
+                    if [ -z "\$POD" ]; then
+                        echo "No predictor pod found — skipping smoke test"
+                        exit 0
+                    fi
+
+                    kubectl port-forward -n ${env.INFERENCE_NS} \$POD 18080:8080 &
+                    PF_PID=\$!
+                    sleep 3
+
+                    echo "--- Health check ---"
+                    STATUS=\$(curl -s -o /dev/null -w "%{http_code}" \\
+                        http://localhost:18080/v2/health/ready)
+                    echo "/v2/health/ready → HTTP \$STATUS"
+
+                    echo "--- Inference smoke ---"
+                    curl -s -X POST http://localhost:18080/v1/models/fraud:predict \\
+                        -H "Content-Type: application/json" \\
+                        -d '{"instances":[{"customer_id":"smoke-test","txn_amount":100.0,"txn_hour":10}]}' | \\
+                        python3 -c "import sys,json; d=json.load(sys.stdin); print(d); assert 'predictions' in d"
+
+                    kill \$PF_PID 2>/dev/null || true
+
+                    if [ "\$STATUS" != "200" ]; then
+                        echo "Smoke test failed: /v2/health/ready returned \$STATUS"
+                        exit 1
+                    fi
+                    echo "Smoke test passed"
+                """
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                if (env.BRANCH_NAME == 'main') {
+                    echo "Track B: CI + CD passed — commit ${env.SHORT_COMMIT} deployed"
+                } else {
+                    echo "Track B: CI passed"
+                }
+            }
+        }
+        failure {
+            script {
+                if (env.BRANCH_NAME == 'main') {
+                    echo "Track B: FAILED — re-applying last known-good manifest"
+                    sh "kubectl apply -f infra/k8s/fraud-inference.yaml || true"
+                } else {
+                    echo "Track B: CI FAILED — check lint / test / load test output"
+                }
+            }
+        }
+        cleanup {
+            sh '''
+                rm -rf .ci-venv test-results-*.xml coverage*.xml || true
+                docker rmi "${IMAGE_REPO}:${SHORT_COMMIT}" "${IMAGE_REPO}:latest" 2>/dev/null || true
+            '''
+        }
+    }
+}

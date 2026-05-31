@@ -1,0 +1,421 @@
+// Track A — Data / ML Pipelines
+//
+// Changeset logic (auto-detected):
+//   src/pipelines/** or infra/docker/airflow/**  → rebuild + push Airflow image → helm upgrade
+//   dags/**                                      → update airflow-dags ConfigMap + restart dag-processor
+//   config/pipeline_config.yaml                  → update fraud-pipeline-config ConfigMap + restart workers
+//   infra/helm/airflow/**                        → helm upgrade only (no image rebuild)
+//
+// Manual trigger:
+//   - Trigger on main with no code change → all CD stages run automatically (empty changeset detected)
+//   - FORCE_DEPLOY=true → same effect, works on any branch
+
+pipeline {
+    agent {
+        kubernetes {
+            defaultContainer 'agent'
+            yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  serviceAccountName: default
+  containers:
+  - name: agent
+    image: ancaotrinh/jenkins:latest
+    imagePullPolicy: Always
+    command: [cat]
+    tty: true
+    env:
+    - name: DOCKER_HOST
+      value: tcp://localhost:2376
+    - name: DOCKER_TLS_CERTDIR
+      value: ""
+  - name: dind
+    image: docker:27-dind
+    securityContext:
+      privileged: true
+    env:
+    - name: DOCKER_TLS_CERTDIR
+      value: ""
+    volumeMounts:
+    - name: docker-storage
+      mountPath: /var/lib/docker
+  volumes:
+  - name: docker-storage
+    emptyDir: {}
+"""
+        }
+    }
+
+    options {
+        timeout(time: 40, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        skipDefaultCheckout()
+    }
+
+    parameters {
+        booleanParam(
+            name: 'FORCE_DEPLOY',
+            defaultValue: false,
+            description: 'Force all CD stages — use for manual deploy or first-time cluster setup'
+        )
+    }
+
+    environment {
+        PYTHONPATH   = "${WORKSPACE}"
+        PIP_QUIET    = "1"
+        IMAGE_REPO   = "ancaotrinh/fraud-airflow"
+        AIRFLOW_NS   = "airflow"
+        HELM_RELEASE = "airflow"
+        HELM_VERSION = "1.21.0"
+    }
+
+    stages {
+
+        // ── Checkout ─────────────────────────────────────────────────────────────
+        // RUN_DEPLOY is true when:
+        //   (a) FORCE_DEPLOY parameter checked, OR
+        //   (b) manual trigger on main (changeSets is empty — no SCM-driven diff)
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.SHORT_COMMIT = sh(
+                        script: 'git rev-parse --short HEAD',
+                        returnStdout: true
+                    ).trim()
+                    env.IMAGE_TAG = "${env.IMAGE_REPO}:${env.SHORT_COMMIT}"
+
+                    def isManualMain = (env.BRANCH_NAME == 'main' &&
+                                        currentBuild.changeSets.isEmpty())
+                    env.RUN_DEPLOY = (params.FORCE_DEPLOY || isManualMain).toString()
+
+                    echo "Commit    : ${env.SHORT_COMMIT}"
+                    echo "Image     : ${env.IMAGE_TAG}"
+                    echo "Branch    : ${env.BRANCH_NAME}"
+                    echo "RUN_DEPLOY: ${env.RUN_DEPLOY}" +
+                         (params.FORCE_DEPLOY   ? " (FORCE_DEPLOY param)"   :
+                          isManualMain          ? " (manual trigger on main)" : "")
+                }
+            }
+        }
+
+        // ── CI — lint & tests ─────────────────────────────────────────────────────
+        stage('Install Dependencies') {
+            when {
+                anyOf {
+                    changeset "src/pipelines/**"
+                    changeset "dags/**"
+                    changeset "config/**"
+                    expression { env.RUN_DEPLOY == 'true' }
+                }
+            }
+            steps {
+                sh '''
+                    python3 -m venv .ci-venv
+                    .ci-venv/bin/pip install --upgrade pip
+                    .ci-venv/bin/pip install \
+                        ruff \
+                        pytest pytest-cov \
+                        numpy pandas scikit-learn xgboost \
+                        fastapi httpx pydantic \
+                        sqlalchemy boto3 pyyaml \
+                        prometheus-fastapi-instrumentator uvicorn
+                '''
+            }
+        }
+
+        stage('Lint') {
+            when {
+                anyOf {
+                    changeset "src/pipelines/**"
+                    changeset "dags/**"
+                    expression { env.RUN_DEPLOY == 'true' }
+                }
+            }
+            steps {
+                sh '.ci-venv/bin/ruff check src/pipelines/ dags/ --output-format=github'
+            }
+        }
+
+        stage('Unit Tests') {
+            when {
+                anyOf {
+                    changeset "src/pipelines/**"
+                    expression { env.RUN_DEPLOY == 'true' }
+                }
+            }
+            steps {
+                sh '''
+                    .ci-venv/bin/pytest tests/unit/ \
+                        -v --tb=short \
+                        --junitxml=test-results-unit.xml \
+                        --cov=src/pipelines --cov-report=xml:coverage-pipelines.xml
+                '''
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true, testResults: 'test-results-unit.xml'
+                }
+            }
+        }
+
+        stage('Integration Tests') {
+            when {
+                anyOf {
+                    changeset "src/pipelines/**"
+                    expression { env.RUN_DEPLOY == 'true' }
+                }
+            }
+            steps {
+                sh '''
+                    .ci-venv/bin/pytest tests/integration/ \
+                        -v --tb=short \
+                        --junitxml=test-results-integration.xml
+                '''
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true, testResults: 'test-results-integration.xml'
+                }
+            }
+        }
+
+        stage('DAG Import Validation') {
+            when {
+                anyOf {
+                    changeset "dags/**"
+                    expression { env.RUN_DEPLOY == 'true' }
+                }
+            }
+            steps {
+                sh '''
+                    .ci-venv/bin/pip install apache-airflow==3.2.0 --quiet
+                    .ci-venv/bin/python - <<'PYEOF'
+import importlib.util, glob, sys, os
+
+dag_files = sorted(glob.glob("dags/*.py"))
+if not dag_files:
+    print("No DAG files found — skipping")
+    sys.exit(0)
+
+failed = []
+for dag_file in dag_files:
+    module_name = os.path.basename(dag_file)[:-3]
+    spec = importlib.util.spec_from_file_location(module_name, dag_file)
+    mod  = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+        print(f"  OK    {dag_file}")
+    except Exception as e:
+        print(f"  FAIL  {dag_file}: {e}")
+        failed.append(dag_file)
+
+if failed:
+    print(f"\n{len(failed)} DAG(s) failed to import: {failed}")
+    sys.exit(1)
+print(f"\nAll {len(dag_files)} DAG(s) parse OK")
+PYEOF
+                '''
+            }
+        }
+
+        // ── CD — Build & push ─────────────────────────────────────────────────────
+        stage('Build Airflow Image') {
+            when {
+                allOf {
+                    branch 'main'
+                    anyOf {
+                        changeset "src/pipelines/**"
+                        changeset "infra/docker/airflow/**"
+                        expression { env.RUN_DEPLOY == 'true' }
+                    }
+                }
+            }
+            steps {
+                sh """
+                    docker build --no-cache \\
+                        -f infra/docker/airflow/Dockerfile \\
+                        -t ${env.IMAGE_TAG} \\
+                        -t ${env.IMAGE_REPO}:latest \\
+                        .
+                """
+            }
+        }
+
+        stage('Push to Docker Hub') {
+            when {
+                allOf {
+                    branch 'main'
+                    anyOf {
+                        changeset "src/pipelines/**"
+                        changeset "infra/docker/airflow/**"
+                        expression { env.RUN_DEPLOY == 'true' }
+                    }
+                }
+            }
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'dockerhub-token',
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
+                    sh """
+                        echo "${DOCKER_PASS}" | docker login -u "${DOCKER_USER}" --password-stdin
+                        docker push ${env.IMAGE_TAG}
+                        docker push ${env.IMAGE_REPO}:latest
+                        docker logout
+                    """
+                }
+            }
+        }
+
+        // ── CD — Helm upgrade ─────────────────────────────────────────────────────
+        stage('Helm Upgrade Airflow') {
+            when {
+                allOf {
+                    branch 'main'
+                    anyOf {
+                        changeset "src/pipelines/**"
+                        changeset "infra/docker/airflow/**"
+                        changeset "infra/helm/airflow/**"
+                        expression { env.RUN_DEPLOY == 'true' }
+                    }
+                }
+            }
+            steps {
+                sh """
+                    helm repo add apache-airflow https://airflow.apache.org --force-update
+                    helm repo update
+
+                    helm upgrade ${env.HELM_RELEASE} apache-airflow/airflow \\
+                        --namespace ${env.AIRFLOW_NS} \\
+                        --version ${env.HELM_VERSION} \\
+                        -f infra/helm/airflow/values.yaml \\
+                        --set images.airflow.tag=${env.SHORT_COMMIT} \\
+                        --set images.airflow.pullPolicy=Always \\
+                        --wait --timeout=10m
+                """
+            }
+        }
+
+        // ── CD — Update DAG ConfigMap ─────────────────────────────────────────────
+        stage('Update DAG ConfigMap') {
+            when {
+                allOf {
+                    branch 'main'
+                    anyOf {
+                        changeset "dags/**"
+                        expression { env.RUN_DEPLOY == 'true' }
+                    }
+                }
+            }
+            steps {
+                sh """
+                    kubectl create configmap airflow-dags -n ${env.AIRFLOW_NS} \\
+                        --from-file=dag_bronze_ingest.py=dags/dag_bronze_ingest.py \\
+                        --from-file=dag_silver_transform.py=dags/dag_silver_transform.py \\
+                        --from-file=dag_gold_model.py=dags/dag_gold_model.py \\
+                        --from-file=dag_feat_customer_90d.py=dags/dag_feat_customer_90d.py \\
+                        --from-file=dag_feat_stream_30m.py=dags/dag_feat_stream_30m.py \\
+                        --from-file=dag_feat_unified.py=dags/dag_feat_unified.py \\
+                        --from-file=dag_ml_label.py=dags/dag_ml_label.py \\
+                        --from-file=dag_ml_train.py=dags/dag_ml_train.py \\
+                        --from-file=dag_ml_batch_score.py=dags/dag_ml_batch_score.py \\
+                        --from-file=dag_drift_monitor.py=dags/dag_drift_monitor.py \\
+                        --from-file=dag_feat_backfill.py=dags/dag_feat_backfill.py \\
+                        --from-file=dag_ml_retrain_trigger.py=dags/dag_ml_retrain_trigger.py \\
+                        --dry-run=client -o yaml | kubectl apply -f -
+
+                    kubectl rollout restart deployment/airflow-dag-processor \\
+                        -n ${env.AIRFLOW_NS}
+                    kubectl rollout status deployment/airflow-dag-processor \\
+                        -n ${env.AIRFLOW_NS} --timeout=3m
+                """
+            }
+        }
+
+        // ── CD — Update pipeline config ───────────────────────────────────────────
+        stage('Update Pipeline Config') {
+            when {
+                allOf {
+                    branch 'main'
+                    anyOf {
+                        changeset "config/pipeline_config.yaml"
+                        expression { env.RUN_DEPLOY == 'true' }
+                    }
+                }
+            }
+            steps {
+                sh """
+                    kubectl create configmap fraud-pipeline-config -n ${env.AIRFLOW_NS} \\
+                        --from-file=pipeline_config.yaml=config/pipeline_config.yaml \\
+                        --dry-run=client -o yaml | kubectl apply -f -
+
+                    kubectl rollout restart statefulset/airflow-worker \\
+                        -n ${env.AIRFLOW_NS}
+                    kubectl rollout restart deployment/airflow-dag-processor \\
+                        -n ${env.AIRFLOW_NS}
+                """
+            }
+        }
+
+        // ── CD — Verify workers ───────────────────────────────────────────────────
+        stage('Verify Airflow Workers') {
+            when {
+                allOf {
+                    branch 'main'
+                    anyOf {
+                        changeset "src/pipelines/**"
+                        changeset "infra/docker/airflow/**"
+                        changeset "infra/helm/airflow/**"
+                        expression { env.RUN_DEPLOY == 'true' }
+                    }
+                }
+            }
+            steps {
+                sh """
+                    kubectl rollout status statefulset/airflow-worker \\
+                        -n ${env.AIRFLOW_NS} --timeout=5m
+
+                    echo "Running worker pods:"
+                    kubectl get pods -n ${env.AIRFLOW_NS} \\
+                        -l component=worker --field-selector=status.phase=Running
+
+                    echo "DAG list (scheduler):"
+                    kubectl exec -n ${env.AIRFLOW_NS} \\
+                        deployment/airflow-scheduler \\
+                        -- airflow dags list 2>/dev/null | head -20 || true
+                """
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                if (env.BRANCH_NAME == 'main') {
+                    echo "Track A: CI + CD passed — commit ${env.SHORT_COMMIT} deployed"
+                } else {
+                    echo "Track A: CI passed"
+                }
+            }
+        }
+        failure {
+            script {
+                if (env.BRANCH_NAME == 'main') {
+                    echo "Track A: FAILED — rolling back Airflow release"
+                    sh "helm rollback ${env.HELM_RELEASE} 0 -n ${env.AIRFLOW_NS} || true"
+                } else {
+                    echo "Track A: CI FAILED — check lint / test / DAG validation output"
+                }
+            }
+        }
+        cleanup {
+            sh '''
+                rm -rf .ci-venv test-results-*.xml coverage-*.xml || true
+                docker rmi "${IMAGE_REPO}:${SHORT_COMMIT}" "${IMAGE_REPO}:latest" 2>/dev/null || true
+            '''
+        }
+    }
+}

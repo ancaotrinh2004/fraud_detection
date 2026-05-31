@@ -1,0 +1,200 @@
+# Airflow Helm values for kind-fraud-detection cluster
+# Chart: apache-airflow 1.21.0  |  App: Airflow 3.2.0
+
+# ── Custom image (baked with src/pipelines + pipeline dependencies) ────────
+images:
+  airflow:
+    repository: ancaotrinh/fraud-airflow
+    tag: latest
+    pullPolicy: Always
+
+# ── Executor ───────────────────────────────────────────────────────────────
+executor: CeleryExecutor
+
+# ── DAG Bundle ────────────────────────────────────────────────────────────
+# src/pipelines is baked into the image → only DAG files need ConfigMap mounts.
+# DAGs use subPath per file to avoid the ConfigMap symlink loop
+# (Airflow scans dags/ directory → whole-dir mount causes recursive loop error).
+dagProcessor:
+  dagBundleConfigList:
+    - name: dags-folder
+      classpath: "airflow.dag_processing.bundles.local.LocalDagBundle"
+      kwargs: {}
+
+  extraVolumes:
+    - name: dags-cm
+      configMap:
+        name: airflow-dags
+    - name: pipeline-config
+      configMap:
+        name: fraud-pipeline-config
+
+  extraVolumeMounts:
+    - name: dags-cm
+      mountPath: /opt/airflow/dags/dag_bronze_ingest.py
+      subPath: dag_bronze_ingest.py
+      readOnly: true
+    - name: dags-cm
+      mountPath: /opt/airflow/dags/dag_silver_transform.py
+      subPath: dag_silver_transform.py
+      readOnly: true
+    - name: dags-cm
+      mountPath: /opt/airflow/dags/dag_gold_model.py
+      subPath: dag_gold_model.py
+      readOnly: true
+    - name: dags-cm
+      mountPath: /opt/airflow/dags/dag_feat_stream_30m.py
+      subPath: dag_feat_stream_30m.py
+      readOnly: true
+    - name: dags-cm
+      mountPath: /opt/airflow/dags/dag_feat_customer_90d.py
+      subPath: dag_feat_customer_90d.py
+      readOnly: true
+    - name: dags-cm
+      mountPath: /opt/airflow/dags/dag_feat_unified.py
+      subPath: dag_feat_unified.py
+      readOnly: true
+    - name: dags-cm
+      mountPath: /opt/airflow/dags/dag_drift_monitor.py
+      subPath: dag_drift_monitor.py
+      readOnly: true
+    - name: dags-cm
+      mountPath: /opt/airflow/dags/dag_ml_label.py
+      subPath: dag_ml_label.py
+      readOnly: true
+    - name: dags-cm
+      mountPath: /opt/airflow/dags/dag_ml_train.py
+      subPath: dag_ml_train.py
+      readOnly: true
+    - name: dags-cm
+      mountPath: /opt/airflow/dags/dag_ml_batch_score.py
+      subPath: dag_ml_batch_score.py
+      readOnly: true
+    - name: dags-cm
+      mountPath: /opt/airflow/dags/dag_ml_retrain_trigger.py
+      subPath: dag_ml_retrain_trigger.py
+      readOnly: true
+    - name: dags-cm
+      mountPath: /opt/airflow/dags/dag_feat_backfill.py
+      subPath: dag_feat_backfill.py
+      readOnly: true
+    - name: pipeline-config
+      mountPath: /opt/airflow/config/pipeline_config.yaml
+      subPath: pipeline_config.yaml
+      readOnly: true
+
+# ── Workers ───────────────────────────────────────────────────────────────
+workers:
+  celery:
+    resources:
+      requests:
+        cpu: 200m
+        memory: 1Gi
+      limits:
+        memory: 12Gi
+    extraVolumes:
+      - name: dags-cm
+        configMap:
+          name: airflow-dags
+      - name: pipeline-config
+        configMap:
+          name: fraud-pipeline-config
+    extraVolumeMounts:
+      - name: dags-cm
+        mountPath: /opt/airflow/dags/dag_bronze_ingest.py
+        subPath: dag_bronze_ingest.py
+        readOnly: true
+      - name: dags-cm
+        mountPath: /opt/airflow/dags/dag_silver_transform.py
+        subPath: dag_silver_transform.py
+        readOnly: true
+      - name: dags-cm
+        mountPath: /opt/airflow/dags/dag_gold_model.py
+        subPath: dag_gold_model.py
+        readOnly: true
+      - name: dags-cm
+        mountPath: /opt/airflow/dags/dag_feat_stream_30m.py
+        subPath: dag_feat_stream_30m.py
+        readOnly: true
+      - name: dags-cm
+        mountPath: /opt/airflow/dags/dag_feat_customer_90d.py
+        subPath: dag_feat_customer_90d.py
+        readOnly: true
+      - name: dags-cm
+        mountPath: /opt/airflow/dags/dag_feat_unified.py
+        subPath: dag_feat_unified.py
+        readOnly: true
+      - name: dags-cm
+        mountPath: /opt/airflow/dags/dag_drift_monitor.py
+        subPath: dag_drift_monitor.py
+        readOnly: true
+      - name: dags-cm
+        mountPath: /opt/airflow/dags/dag_ml_label.py
+        subPath: dag_ml_label.py
+        readOnly: true
+      - name: dags-cm
+        mountPath: /opt/airflow/dags/dag_ml_train.py
+        subPath: dag_ml_train.py
+        readOnly: true
+      - name: dags-cm
+        mountPath: /opt/airflow/dags/dag_ml_batch_score.py
+        subPath: dag_ml_batch_score.py
+        readOnly: true
+      - name: dags-cm
+        mountPath: /opt/airflow/dags/dag_ml_retrain_trigger.py
+        subPath: dag_ml_retrain_trigger.py
+        readOnly: true
+      - name: dags-cm
+        mountPath: /opt/airflow/dags/dag_feat_backfill.py
+        subPath: dag_feat_backfill.py
+        readOnly: true
+      - name: pipeline-config
+        mountPath: /opt/airflow/config/pipeline_config.yaml
+        subPath: pipeline_config.yaml
+        readOnly: true
+
+# ── Celery config ─────────────────────────────────────────────────────────
+config:
+  celery:
+    worker_concurrency: 2
+
+# ── Scheduler ─────────────────────────────────────────────────────────────
+scheduler:
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+# ── Disable non-essential components ──────────────────────────────────────
+flower:
+  enabled: false
+
+# ── Webserver/API access ───────────────────────────────────────────────────
+apiServer:
+  service:
+    type: ClusterIP
+
+# ── Logs ──────────────────────────────────────────────────────────────────
+logs:
+  persistence:
+    enabled: false
+
+# ── Pipeline credentials (override config values in all pods) ─────────────
+# K8s Secret fraud-pipeline-secrets exists in infra/k8s/ — reference for prod.
+# For this local cluster the values are injected directly.
+env:
+  - name: PYTHONPATH
+    value: "/opt/airflow"
+  - name: POSTGRES_PASSWORD
+    value: "fraud_pass"
+  - name: MINIO_ACCESS_KEY
+    value: "fraud_minio_user"
+  - name: MINIO_SECRET_KEY
+    value: "fraud_minio_pass"
+  # ── DataHub lineage backend ───────────────────────────────────────────────
+  - name: AIRFLOW__LINEAGE__BACKEND
+    value: "datahub_provider.lineage.datahub.DatahubLineageBackend"
+  - name: AIRFLOW__LINEAGE__DATAHUB_KWARGS
+    value: '{"datahub_conn_id": "datahub_rest_default"}'
+  # Airflow connection for DataHub GMS (cluster-internal URL)
+  - name: AIRFLOW_CONN_DATAHUB_REST_DEFAULT
+    value: "http://datahub-datahub-gms.datahub.svc.cluster.local:8080"

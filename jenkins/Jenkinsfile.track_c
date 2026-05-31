@@ -1,0 +1,604 @@
+// Track C — IaC (Infrastructure as Code)
+//
+// Changeset logic (auto-detected):
+//   infra/helm/monitoring/**                   → helm upgrade kube-prometheus-stack 85.2.0
+//   infra/helm/airflow/**                      → helm upgrade airflow 1.21.0 (values-only)
+//   infra/helm/datahub/prerequisites-values.yaml → helm upgrade datahub-prerequisites 0.3.0
+//   infra/helm/datahub/datahub-values.yaml     → helm upgrade datahub 0.9.12
+//   infra/k8s/fraud-pipeline-secret.yaml       → kubectl apply secret
+//   infra/k8s/pushgateway.yaml                 → kubectl apply + rollout status
+//   infra/k8s/fraud-inference-monitor.yaml     → kubectl apply ServiceMonitor
+//   infra/k8s/fraud-inference.yaml             → kubectl apply InferenceService spec
+//   infra/k8s/net-istio.yaml                   → kubectl apply Istio/Knative config
+//
+// Manual trigger:
+//   - Trigger on main with no code change → all CD stages run automatically (empty changeset detected)
+//   - FORCE_DEPLOY=true → same effect, works on any branch
+
+pipeline {
+    agent {
+        kubernetes {
+            defaultContainer 'agent'
+            yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  serviceAccountName: default
+  containers:
+  - name: agent
+    image: ancaotrinh/jenkins:latest
+    imagePullPolicy: Always
+    command: [cat]
+    tty: true
+    env:
+    - name: DOCKER_HOST
+      value: tcp://localhost:2376
+    - name: DOCKER_TLS_CERTDIR
+      value: ""
+  - name: dind
+    image: docker:27-dind
+    securityContext:
+      privileged: true
+    env:
+    - name: DOCKER_TLS_CERTDIR
+      value: ""
+    volumeMounts:
+    - name: docker-storage
+      mountPath: /var/lib/docker
+  volumes:
+  - name: docker-storage
+    emptyDir: {}
+"""
+        }
+    }
+
+    options {
+        timeout(time: 45, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        skipDefaultCheckout()
+    }
+
+    parameters {
+        booleanParam(
+            name: 'FORCE_DEPLOY',
+            defaultValue: false,
+            description: 'Force all CD stages — use for manual deploy or first-time cluster setup'
+        )
+    }
+
+    environment {
+        MONITORING_NS = "monitoring"
+        FRAUD_NS      = "fraud-infra"
+        AIRFLOW_NS    = "airflow"
+        DATAHUB_NS    = "datahub"
+
+        // Pinned Helm chart versions (per docs)
+        MONITORING_CHART_VER  = "85.2.0"
+        AIRFLOW_CHART_VER     = "1.21.0"
+        DATAHUB_PREREQ_VER    = "0.3.0"
+        DATAHUB_CHART_VER     = "0.9.12"
+    }
+
+    stages {
+
+        // ── Checkout ─────────────────────────────────────────────────────────────
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    def isManualMain = (env.BRANCH_NAME == 'main' &&
+                                        currentBuild.changeSets.isEmpty())
+                    env.RUN_DEPLOY = (params.FORCE_DEPLOY || isManualMain).toString()
+
+                    echo "Branch    : ${env.BRANCH_NAME}"
+                    echo "RUN_DEPLOY: ${env.RUN_DEPLOY}" +
+                         (params.FORCE_DEPLOY ? " (FORCE_DEPLOY param)"    :
+                          isManualMain        ? " (manual trigger on main)" : "")
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════════════════════════
+        // CI — Validation (runs on every PR touching infra/)
+        // ════════════════════════════════════════════════════════════════════════
+
+        stage('Helm Lint — Monitoring') {
+            when {
+                anyOf {
+                    changeset "infra/helm/monitoring/**"
+                    expression { env.RUN_DEPLOY == 'true' }
+                }
+            }
+            steps {
+                sh """
+                    helm repo add prometheus-community \\
+                        https://prometheus-community.github.io/helm-charts --force-update
+                    helm repo update
+
+                    echo "--- Linting kube-prometheus-stack overrides ---"
+                    helm lint infra/helm/monitoring/ \\
+                        --values infra/helm/monitoring/values.yaml
+
+                    echo "--- Template render ---"
+                    helm template kube-prom prometheus-community/kube-prometheus-stack \\
+                        --version ${env.MONITORING_CHART_VER} \\
+                        --values infra/helm/monitoring/values.yaml \\
+                        --namespace ${env.MONITORING_NS} > /dev/null
+                    echo "Monitoring: lint + template OK"
+                """
+            }
+        }
+
+        stage('Helm Lint — Airflow') {
+            when {
+                anyOf {
+                    changeset "infra/helm/airflow/**"
+                    expression { env.RUN_DEPLOY == 'true' }
+                }
+            }
+            steps {
+                sh """
+                    helm repo add apache-airflow https://airflow.apache.org --force-update
+                    helm repo update
+
+                    echo "--- Template render for Airflow values ---"
+                    helm template airflow apache-airflow/airflow \\
+                        --version ${env.AIRFLOW_CHART_VER} \\
+                        --values infra/helm/airflow/values.yaml \\
+                        --namespace ${env.AIRFLOW_NS} > /dev/null
+                    echo "Airflow: template render OK"
+                """
+            }
+        }
+
+        stage('Helm Lint — DataHub') {
+            when {
+                anyOf {
+                    changeset "infra/helm/datahub/**"
+                    expression { env.RUN_DEPLOY == 'true' }
+                }
+            }
+            steps {
+                sh """
+                    helm repo add datahub https://helm.datahubproject.io/ --force-update
+                    helm repo update
+
+                    echo "--- Template render for DataHub prerequisites ---"
+                    helm template prerequisites datahub/datahub-prerequisites \\
+                        --version ${env.DATAHUB_PREREQ_VER} \\
+                        --values infra/helm/datahub/prerequisites-values.yaml \\
+                        --namespace ${env.DATAHUB_NS} > /dev/null
+
+                    echo "--- Template render for DataHub ---"
+                    helm template datahub datahub/datahub \\
+                        --version ${env.DATAHUB_CHART_VER} \\
+                        --values infra/helm/datahub/datahub-values.yaml \\
+                        --namespace ${env.DATAHUB_NS} > /dev/null
+                    echo "DataHub: template render OK"
+                """
+            }
+        }
+
+        stage('kubectl Dry-Run — K8s Manifests') {
+            when {
+                anyOf {
+                    changeset "infra/k8s/**"
+                    expression { env.RUN_DEPLOY == 'true' }
+                }
+            }
+            steps {
+                sh """
+                    MANIFESTS="
+                        infra/k8s/fraud-pipeline-secret.yaml
+                        infra/k8s/pushgateway.yaml
+                        infra/k8s/fraud-inference-monitor.yaml
+                        infra/k8s/fraud-inference.yaml
+                        infra/k8s/net-istio.yaml
+                    "
+                    FAILED=0
+                    for f in \$MANIFESTS; do
+                        if [ ! -f "\$f" ]; then
+                            echo "  SKIP  \$f (not found)"
+                            continue
+                        fi
+                        if kubectl apply --dry-run=client -f "\$f" > /dev/null 2>&1; then
+                            echo "  OK    \$f"
+                        else
+                            echo "  FAIL  \$f"
+                            kubectl apply --dry-run=client -f "\$f"
+                            FAILED=1
+                        fi
+                    done
+                    [ \$FAILED -eq 0 ] || { echo "One or more manifests failed dry-run"; exit 1; }
+                    echo "All manifest dry-runs passed"
+                """
+            }
+        }
+
+        stage('Validate DAG ConfigMap References') {
+            when {
+                anyOf {
+                    changeset "infra/helm/airflow/**"
+                    changeset "dags/**"
+                    expression { env.RUN_DEPLOY == 'true' }
+                }
+            }
+            steps {
+                sh """
+                    python3 - <<'PYEOF'
+import os, sys, yaml
+
+values_file = "infra/helm/airflow/values.yaml"
+if not os.path.exists(values_file):
+    print(f"No {values_file} — skipping")
+    sys.exit(0)
+
+with open(values_file) as f:
+    vals = yaml.safe_load(f)
+
+missing, found = [], []
+for section in ["dagProcessor", "workers", "scheduler", "triggerer"]:
+    for mount in vals.get(section, {}).get("extraVolumeMounts", []):
+        if "dags-cm" in mount.get("name", ""):
+            dag_file = "dags/" + mount.get("subPath", "")
+            if not os.path.exists(dag_file):
+                missing.append(dag_file)
+                print(f"  MISSING  {dag_file}")
+            elif dag_file not in found:
+                found.append(dag_file)
+                print(f"  OK       {dag_file}")
+
+if missing:
+    print(f"\\n{len(missing)} DAG file(s) referenced but missing on disk")
+    sys.exit(1)
+print(f"\\nAll {len(found)} DAG ConfigMap references are valid")
+PYEOF
+                """
+            }
+        }
+
+        // ════════════════════════════════════════════════════════════════════════
+        // CD — Apply (main branch only)
+        // ════════════════════════════════════════════════════════════════════════
+
+        stage('Ensure Namespaces') {
+            when {
+                allOf {
+                    branch 'main'
+                    anyOf {
+                        changeset "infra/**"
+                        expression { env.RUN_DEPLOY == 'true' }
+                    }
+                }
+            }
+            steps {
+                sh """
+                    for ns in ${env.FRAUD_NS} ${env.MONITORING_NS} ${env.AIRFLOW_NS} ${env.DATAHUB_NS}; do
+                        kubectl create namespace \$ns --dry-run=client -o yaml | kubectl apply -f -
+                        echo "  namespace/\$ns OK"
+                    done
+                """
+            }
+        }
+
+        stage('Apply Pipeline Secret') {
+            when {
+                allOf {
+                    branch 'main'
+                    anyOf {
+                        changeset "infra/k8s/fraud-pipeline-secret.yaml"
+                        expression { env.RUN_DEPLOY == 'true' }
+                    }
+                }
+            }
+            steps {
+                sh """
+                    kubectl apply -f infra/k8s/fraud-pipeline-secret.yaml -n ${env.FRAUD_NS}
+                    echo "fraud-pipeline-secret applied"
+                """
+            }
+        }
+
+        stage('Apply Istio / Knative Config') {
+            when {
+                allOf {
+                    branch 'main'
+                    anyOf {
+                        changeset "infra/k8s/net-istio.yaml"
+                        expression { env.RUN_DEPLOY == 'true' }
+                    }
+                }
+            }
+            steps {
+                sh """
+                    kubectl apply -f infra/k8s/net-istio.yaml
+                    echo "net-istio config applied"
+
+                    kubectl get pods -n knative-serving \\
+                        -l app=net-istio-controller 2>/dev/null || true
+                """
+            }
+        }
+
+        stage('Apply Pushgateway') {
+            when {
+                allOf {
+                    branch 'main'
+                    anyOf {
+                        changeset "infra/k8s/pushgateway.yaml"
+                        expression { env.RUN_DEPLOY == 'true' }
+                    }
+                }
+            }
+            steps {
+                sh """
+                    kubectl apply -f infra/k8s/pushgateway.yaml -n ${env.MONITORING_NS}
+                    kubectl rollout status deployment/pushgateway \\
+                        -n ${env.MONITORING_NS} --timeout=2m
+                    echo "Pushgateway: Ready"
+                """
+            }
+        }
+
+        stage('Apply Inference ServiceMonitor') {
+            when {
+                allOf {
+                    branch 'main'
+                    anyOf {
+                        changeset "infra/k8s/fraud-inference-monitor.yaml"
+                        expression { env.RUN_DEPLOY == 'true' }
+                    }
+                }
+            }
+            steps {
+                sh """
+                    kubectl apply -f infra/k8s/fraud-inference-monitor.yaml
+                    echo "ServiceMonitor applied"
+                    kubectl get servicemonitor fraud-inference 2>/dev/null || true
+                """
+            }
+        }
+
+        stage('Helm Upgrade — Monitoring Stack') {
+            when {
+                allOf {
+                    branch 'main'
+                    anyOf {
+                        changeset "infra/helm/monitoring/**"
+                        changeset "infra/k8s/pushgateway.yaml"
+                        expression { env.RUN_DEPLOY == 'true' }
+                    }
+                }
+            }
+            steps {
+                sh """
+                    helm repo add prometheus-community \\
+                        https://prometheus-community.github.io/helm-charts --force-update
+                    helm repo update
+
+                    helm upgrade --install kube-prom \\
+                        prometheus-community/kube-prometheus-stack \\
+                        --namespace ${env.MONITORING_NS} \\
+                        --create-namespace \\
+                        --version ${env.MONITORING_CHART_VER} \\
+                        -f infra/helm/monitoring/values.yaml \\
+                        --wait --timeout=10m
+
+                    echo "kube-prometheus-stack ${env.MONITORING_CHART_VER} deployed"
+                """
+            }
+            post {
+                success {
+                    sh """
+                        echo "=== Monitoring pods ==="
+                        kubectl get pods -n ${env.MONITORING_NS}
+                        echo ""
+                        echo "=== ServiceMonitors ==="
+                        kubectl get servicemonitors -n ${env.MONITORING_NS} 2>/dev/null || true
+                    """
+                }
+            }
+        }
+
+        stage('Helm Upgrade — DataHub Prerequisites') {
+            when {
+                allOf {
+                    branch 'main'
+                    anyOf {
+                        changeset "infra/helm/datahub/prerequisites-values.yaml"
+                        expression { env.RUN_DEPLOY == 'true' }
+                    }
+                }
+            }
+            steps {
+                sh """
+                    helm repo add datahub https://helm.datahubproject.io/ --force-update
+                    helm repo update
+
+                    kubectl create secret generic mysql-secrets \\
+                        --namespace ${env.DATAHUB_NS} \\
+                        --from-literal=mysql-root-password=datahub \\
+                        --from-literal=mysql-password=datahub \\
+                        --from-literal=mysql-replication-password=datahub \\
+                        --dry-run=client -o yaml | kubectl apply -f -
+
+                    helm upgrade --install prerequisites datahub/datahub-prerequisites \\
+                        --namespace ${env.DATAHUB_NS} \\
+                        --create-namespace \\
+                        --version ${env.DATAHUB_PREREQ_VER} \\
+                        --values infra/helm/datahub/prerequisites-values.yaml \\
+                        --wait --timeout=10m
+
+                    echo "DataHub prerequisites ${env.DATAHUB_PREREQ_VER} deployed"
+                """
+            }
+            post {
+                success {
+                    sh """
+                        echo "=== DataHub prerequisite pods ==="
+                        kubectl get pods -n ${env.DATAHUB_NS} \\
+                            -l 'app.kubernetes.io/instance=prerequisites'
+                    """
+                }
+            }
+        }
+
+        stage('Helm Upgrade — DataHub') {
+            when {
+                allOf {
+                    branch 'main'
+                    anyOf {
+                        changeset "infra/helm/datahub/datahub-values.yaml"
+                        expression { env.RUN_DEPLOY == 'true' }
+                    }
+                }
+            }
+            steps {
+                sh """
+                    helm repo add datahub https://helm.datahubproject.io/ --force-update
+                    helm repo update
+
+                    kubectl create secret generic datahub-mysql-secrets \\
+                        --namespace ${env.DATAHUB_NS} \\
+                        --from-literal=mysql-password=datahub \\
+                        --dry-run=client -o yaml | kubectl apply -f -
+
+                    helm upgrade --install datahub datahub/datahub \\
+                        --namespace ${env.DATAHUB_NS} \\
+                        --version ${env.DATAHUB_CHART_VER} \\
+                        --values infra/helm/datahub/datahub-values.yaml \\
+                        --wait --timeout=15m
+
+                    echo "DataHub ${env.DATAHUB_CHART_VER} deployed"
+                """
+            }
+            post {
+                success {
+                    sh """
+                        echo "=== DataHub pods ==="
+                        kubectl get pods -n ${env.DATAHUB_NS}
+                    """
+                }
+            }
+        }
+
+        stage('Helm Upgrade — Airflow Values') {
+            when {
+                allOf {
+                    branch 'main'
+                    anyOf {
+                        changeset "infra/helm/airflow/**"
+                        expression { env.RUN_DEPLOY == 'true' }
+                    }
+                    // Skip if pipeline code also changed — Track A handles that with image rebuild
+                    not { changeset "src/pipelines/**" }
+                    not { changeset "infra/docker/airflow/**" }
+                }
+            }
+            steps {
+                sh """
+                    helm repo add apache-airflow https://airflow.apache.org --force-update
+                    helm repo update
+
+                    helm upgrade airflow apache-airflow/airflow \\
+                        --namespace ${env.AIRFLOW_NS} \\
+                        --version ${env.AIRFLOW_CHART_VER} \\
+                        --values infra/helm/airflow/values.yaml \\
+                        --reuse-values \\
+                        --wait --timeout=10m
+
+                    echo "Airflow values-only upgrade complete"
+                """
+            }
+        }
+
+        // ── Post-Apply Health Checks ──────────────────────────────────────────────
+        stage('Post-Apply Health Checks') {
+            when {
+                allOf {
+                    branch 'main'
+                    anyOf {
+                        changeset "infra/**"
+                        expression { env.RUN_DEPLOY == 'true' }
+                    }
+                }
+            }
+            steps {
+                sh """
+                    echo "════════════════════════════════════════"
+                    echo " Post-Apply Health Checks"
+                    echo "════════════════════════════════════════"
+
+                    echo ""
+                    echo "── Monitoring (${env.MONITORING_NS}) ──"
+                    PROM_RUNNING=\$(kubectl get pods -n ${env.MONITORING_NS} \\
+                        --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l)
+                    echo "  Running pods: \$PROM_RUNNING"
+                    kubectl get pods -n ${env.MONITORING_NS} --field-selector=status.phase=Running \\
+                        --no-headers 2>/dev/null | awk '{print "  " \$1 "  " \$3}' | head -20
+
+                    echo ""
+                    echo "── Pushgateway ──"
+                    kubectl get pod -n ${env.MONITORING_NS} \\
+                        -l app=pushgateway --field-selector=status.phase=Running \\
+                        --no-headers 2>/dev/null && echo "  [OK] running" || echo "  [WARN] not found"
+
+                    echo ""
+                    echo "── ServiceMonitor fraud-inference ──"
+                    kubectl get servicemonitor fraud-inference \\
+                        -o jsonpath='  {.metadata.name}  port={.spec.endpoints[0].port}  path={.spec.endpoints[0].path}\\n' \\
+                        2>/dev/null || echo "  (not found — may not have been applied this run)"
+
+                    echo ""
+                    echo "── fraud-infra (${env.FRAUD_NS}) ──"
+                    kubectl get pods -n ${env.FRAUD_NS} --no-headers 2>/dev/null | \\
+                        awk '{print "  " \$1 "  " \$3}' || echo "  (no pods)"
+
+                    echo ""
+                    echo "── DataHub (${env.DATAHUB_NS}) ──"
+                    DATAHUB_RUNNING=\$(kubectl get pods -n ${env.DATAHUB_NS} \\
+                        --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l)
+                    echo "  Running pods: \$DATAHUB_RUNNING"
+
+                    echo ""
+                    echo "── Airflow (${env.AIRFLOW_NS}) ──"
+                    AIRFLOW_RUNNING=\$(kubectl get pods -n ${env.AIRFLOW_NS} \\
+                        --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l)
+                    echo "  Running pods: \$AIRFLOW_RUNNING"
+
+                    echo ""
+                    echo "════════════════════════════════════════"
+                    echo " Health checks complete"
+                    echo "════════════════════════════════════════"
+                """
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                if (env.BRANCH_NAME == 'main') {
+                    echo "Track C: CI + CD passed — IaC applied successfully"
+                } else {
+                    echo "Track C: CI passed — IaC validation clean"
+                }
+            }
+        }
+        failure {
+            script {
+                if (env.BRANCH_NAME == 'main') {
+                    echo "Track C: FAILED — attempting Helm rollbacks"
+                    sh """
+                        helm rollback kube-prom 0 -n ${env.MONITORING_NS} 2>/dev/null || true
+                        helm rollback datahub   0 -n ${env.DATAHUB_NS}    2>/dev/null || true
+                        helm rollback airflow   0 -n ${env.AIRFLOW_NS}    2>/dev/null || true
+                        echo "Rollback attempts done — check: helm history <release> -n <namespace>"
+                    """
+                } else {
+                    echo "Track C: CI FAILED — review Helm lint / kubectl dry-run output"
+                }
+            }
+        }
+    }
+}

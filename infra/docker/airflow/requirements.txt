@@ -1,0 +1,25 @@
+# Airflow worker/scheduler dependencies — installed on top of apache/airflow:3.2.0
+#
+# Rule: only add packages NOT already in the base image.
+# Do NOT pin pandas, pyyaml, sqlalchemy, pyarrow — those are managed by Airflow.
+# Pinning them here risks downgrading Airflow's own dependencies and breaking it.
+
+# Lakehouse (pins pyarrow to <19 automatically via its own constraint)
+deltalake==0.25.4
+
+# S3/MinIO support for Delta Lake and pandas reads
+boto3
+s3fs
+
+# Database driver (psycopg2-binary is an additional driver, not in base image)
+psycopg2-binary
+
+# Query engine
+duckdb==1.2.2
+
+# ML training
+xgboost==2.1.4
+scikit-learn==1.6.1
+
+# Monitoring — push pipeline metrics to Prometheus Pushgateway
+prometheus_client
