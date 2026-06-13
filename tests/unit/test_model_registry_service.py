@@ -1,9 +1,15 @@
 """
-Unit tests for ModelRegistryService — SQLAlchemy engine fully mocked.
+Unit tests for ModelRegistryService — MLflow Model Registry fully mocked.
+
+The registry was migrated from a PostgreSQL ml_model_registry table to the
+MLflow Model Registry, so these tests mock mlflow.tracking.MlflowClient and
+assert on the client calls (create_model_version, transition_model_version_stage,
+get_latest_versions, get_run) rather than on SQL.
+
 Coverage: register, get_production_version, promote, rollback.
 """
 
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -11,8 +17,20 @@ from src.pipelines.ml.services import ModelRegistryService
 
 
 @pytest.fixture
-def svc(mock_engine):
-    return ModelRegistryService(mock_engine)
+def mock_client():
+    client = MagicMock()
+    # create_model_version() returns a ModelVersion-like object exposing `.version`
+    client.create_model_version.return_value = MagicMock(version="3")
+    return client
+
+
+@pytest.fixture
+def svc(mock_cfg, mock_client):
+    # MlflowClient is instantiated in __init__; patch it so no server is contacted.
+    with patch("mlflow.tracking.MlflowClient", return_value=mock_client), \
+         patch("mlflow.set_tracking_uri"):
+        service = ModelRegistryService(mock_cfg)
+    return service
 
 
 @pytest.fixture
@@ -28,150 +46,137 @@ def sample_metrics():
 # ── register ───────────────────────────────────────────────────────────────────
 
 class TestRegister:
-    def test_executes_insert_sql(self, svc, mock_engine, sample_metrics):
-        svc.register("v_001", sample_metrics, "s3://models/v_001/model.pkl", 10000)
-        conn = mock_engine.begin.return_value.__enter__.return_value
-        conn.execute.assert_called_once()
+    def test_creates_model_version(self, svc, mock_client, sample_metrics):
+        svc.register("run_001", sample_metrics, "s3://art/m-1/artifacts", 10000)
+        mock_client.create_model_version.assert_called_once()
 
-    def test_passes_model_version(self, svc, mock_engine, sample_metrics):
-        svc.register("v_test_version", sample_metrics, "s3://test", 100)
-        conn = mock_engine.begin.return_value.__enter__.return_value
-        params = conn.execute.call_args[0][1]
-        assert params["ver"] == "v_test_version"
+    def test_create_model_version_gets_source_and_run_id(self, svc, mock_client, sample_metrics):
+        svc.register("run_xyz", sample_metrics, "s3://art/m-9/artifacts", 100)
+        kwargs = mock_client.create_model_version.call_args[1]
+        assert kwargs["source"] == "s3://art/m-9/artifacts"
+        assert kwargs["run_id"] == "run_xyz"
+        assert kwargs["name"] == svc._model_name
 
-    def test_passes_metrics_values(self, svc, mock_engine, sample_metrics):
-        svc.register("v_001", sample_metrics, "s3://test", 100)
-        conn = mock_engine.begin.return_value.__enter__.return_value
-        params = conn.execute.call_args[0][1]
-        assert params["pr_auc"] == sample_metrics["pr_auc"]
-        assert params["f1"]     == sample_metrics["f1"]
-        assert params["prec"]   == sample_metrics["precision"]
-        assert params["rec"]    == sample_metrics["recall"]
+    def test_returns_version_string(self, svc, sample_metrics):
+        version = svc.register("run_001", sample_metrics, "s3://art", 100)
+        assert version == "3"
 
-    def test_default_status_is_candidate(self, svc, mock_engine, sample_metrics):
-        svc.register("v_001", sample_metrics, "s3://test", 100)
-        conn = mock_engine.begin.return_value.__enter__.return_value
-        params = conn.execute.call_args[0][1]
-        assert params["status"] == "candidate"
+    def test_candidate_transitions_to_staging(self, svc, mock_client, sample_metrics):
+        svc.register("run_001", sample_metrics, "s3://art", 100, status="candidate")
+        kwargs = mock_client.transition_model_version_stage.call_args[1]
+        assert kwargs["stage"] == "Staging"
+        assert kwargs["version"] == "3"
 
-    def test_custom_status_passed_through(self, svc, mock_engine, sample_metrics):
-        svc.register("v_001", sample_metrics, "s3://test", 100, status="production")
-        conn = mock_engine.begin.return_value.__enter__.return_value
-        params = conn.execute.call_args[0][1]
-        assert params["status"] == "production"
+    def test_default_status_is_candidate(self, svc, mock_client, sample_metrics):
+        svc.register("run_001", sample_metrics, "s3://art", 100)
+        kwargs = mock_client.transition_model_version_stage.call_args[1]
+        assert kwargs["stage"] == "Staging"
 
-    def test_artifact_path_passed(self, svc, mock_engine, sample_metrics):
-        path = "s3://models/fraud_xgb/v_001/model.pkl"
-        svc.register("v_001", sample_metrics, path, 100)
-        conn = mock_engine.begin.return_value.__enter__.return_value
-        params = conn.execute.call_args[0][1]
-        assert params["path"] == path
+    def test_non_candidate_transitions_to_production(self, svc, mock_client, sample_metrics):
+        svc.register("run_001", sample_metrics, "s3://art", 100, status="production")
+        kwargs = mock_client.transition_model_version_stage.call_args[1]
+        assert kwargs["stage"] == "Production"
 
-    def test_train_rows_passed(self, svc, mock_engine, sample_metrics):
-        svc.register("v_001", sample_metrics, "s3://test", 50000)
-        conn = mock_engine.begin.return_value.__enter__.return_value
-        params = conn.execute.call_args[0][1]
-        assert params["rows"] == 50000
+    def test_sets_pr_auc_tag(self, svc, mock_client, sample_metrics):
+        svc.register("run_001", sample_metrics, "s3://art", 100)
+        tag_calls = {c.args[2]: c.args[3] for c in mock_client.set_model_version_tag.call_args_list}
+        assert tag_calls["pr_auc"] == str(sample_metrics["pr_auc"])
+
+    def test_sets_train_rows_tag(self, svc, mock_client, sample_metrics):
+        svc.register("run_001", sample_metrics, "s3://art", 50000)
+        tag_calls = {c.args[2]: c.args[3] for c in mock_client.set_model_version_tag.call_args_list}
+        assert tag_calls["train_rows"] == "50000"
+
+    def test_ensures_registered_model_exists(self, svc, mock_client, sample_metrics):
+        svc.register("run_001", sample_metrics, "s3://art", 100)
+        mock_client.create_registered_model.assert_called_once_with(svc._model_name)
+
+    def test_tolerates_already_existing_registered_model(self, svc, mock_client, sample_metrics):
+        from mlflow.exceptions import MlflowException
+        mock_client.create_registered_model.side_effect = MlflowException("already exists")
+        # Must not raise — the existing-model case is swallowed.
+        version = svc.register("run_001", sample_metrics, "s3://art", 100)
+        assert version == "3"
 
 
 # ── get_production_version ─────────────────────────────────────────────────────
 
 class TestGetProductionVersion:
-    def test_returns_dict_when_production_model_exists(self, svc, mock_engine):
-        conn = mock_engine.connect.return_value.__enter__.return_value
-        conn.execute.return_value.fetchone.return_value = (
-            "v_20260101_120000", 0.85, "s3://models/v_20260101/model.pkl"
-        )
-        result = svc.get_production_version()
-        assert isinstance(result, dict)
+    @pytest.fixture
+    def prod_version(self, mock_client):
+        v = MagicMock(version="5", run_id="run_5", tags={"pr_auc": "0.90"})
+        mock_client.get_latest_versions.return_value = [v]
+        run = MagicMock()
+        run.data.metrics = {"pr_auc": 0.88}
+        mock_client.get_run.return_value = run
+        return v
 
-    def test_returned_dict_has_required_keys(self, svc, mock_engine):
-        conn = mock_engine.connect.return_value.__enter__.return_value
-        conn.execute.return_value.fetchone.return_value = (
-            "v_001", 0.85, "s3://test/model.pkl"
-        )
+    def test_returns_dict_with_required_keys(self, svc, prod_version):
         result = svc.get_production_version()
-        assert "model_version" in result
-        assert "pr_auc" in result
-        assert "artifact_path" in result
+        assert set(["model_version", "pr_auc", "artifact_path"]).issubset(result)
 
-    def test_returned_values_match_db_row(self, svc, mock_engine):
-        conn = mock_engine.connect.return_value.__enter__.return_value
-        conn.execute.return_value.fetchone.return_value = (
-            "v_20260101", 0.8148, "s3://models/v_20260101/model.pkl"
-        )
-        result = svc.get_production_version()
-        assert result["model_version"] == "v_20260101"
-        assert result["pr_auc"]        == pytest.approx(0.8148)
-        assert result["artifact_path"] == "s3://models/v_20260101/model.pkl"
+    def test_model_version_matches(self, svc, prod_version):
+        assert svc.get_production_version()["model_version"] == "5"
 
-    def test_pr_auc_is_float(self, svc, mock_engine):
-        conn = mock_engine.connect.return_value.__enter__.return_value
-        conn.execute.return_value.fetchone.return_value = ("v_001", "0.85", "s3://test")
+    def test_pr_auc_from_run_metrics(self, svc, prod_version):
         result = svc.get_production_version()
+        assert result["pr_auc"] == pytest.approx(0.88)
         assert isinstance(result["pr_auc"], float)
 
-    def test_returns_none_when_no_production_model(self, svc, mock_engine):
-        conn = mock_engine.connect.return_value.__enter__.return_value
-        conn.execute.return_value.fetchone.return_value = None
+    def test_artifact_path_is_models_production_uri(self, svc, prod_version):
         result = svc.get_production_version()
-        assert result is None
+        assert result["artifact_path"] == f"models:/{svc._model_name}/Production"
 
-    def test_queries_production_status(self, svc, mock_engine):
-        conn = mock_engine.connect.return_value.__enter__.return_value
-        conn.execute.return_value.fetchone.return_value = None
+    def test_queries_production_stage(self, svc, prod_version, mock_client):
         svc.get_production_version()
-        sql = str(conn.execute.call_args[0][0])
-        assert "production" in sql.lower()
+        kwargs = mock_client.get_latest_versions.call_args
+        assert "Production" in str(kwargs)
+
+    def test_pr_auc_falls_back_to_tag_when_run_lookup_fails(self, svc, prod_version, mock_client):
+        mock_client.get_run.side_effect = RuntimeError("run gone")
+        result = svc.get_production_version()
+        assert result["pr_auc"] == pytest.approx(0.90)  # from v.tags
+
+    def test_returns_none_when_no_production_model(self, svc, mock_client):
+        mock_client.get_latest_versions.return_value = []
+        assert svc.get_production_version() is None
+
+    def test_returns_none_when_registry_errors(self, svc, mock_client):
+        mock_client.get_latest_versions.side_effect = RuntimeError("registry down")
+        assert svc.get_production_version() is None
 
 
 # ── promote ─────────────────────────────────────────────────────────────────────
 
 class TestPromote:
-    def test_executes_two_update_statements(self, svc, mock_engine):
-        conn = mock_engine.begin.return_value.__enter__.return_value
-        svc.promote("v_new")
-        assert conn.execute.call_count == 2
+    def test_transitions_to_production(self, svc, mock_client):
+        svc.promote("7")
+        mock_client.transition_model_version_stage.assert_called_once()
+        kwargs = mock_client.transition_model_version_stage.call_args[1]
+        assert kwargs["version"] == "7"
+        assert kwargs["stage"] == "Production"
 
-    def test_first_update_retires_current_production(self, svc, mock_engine):
-        conn = mock_engine.begin.return_value.__enter__.return_value
-        svc.promote("v_new")
-        first_sql = str(conn.execute.call_args_list[0][0][0])
-        assert "retired" in first_sql
+    def test_archives_existing_production_versions(self, svc, mock_client):
+        svc.promote("7")
+        kwargs = mock_client.transition_model_version_stage.call_args[1]
+        assert kwargs["archive_existing_versions"] is True
 
-    def test_second_update_sets_new_production(self, svc, mock_engine):
-        conn = mock_engine.begin.return_value.__enter__.return_value
-        svc.promote("v_new")
-        second_sql  = str(conn.execute.call_args_list[1][0][0])
-        second_params = conn.execute.call_args_list[1][0][1]
-        assert "production" in second_sql
-        assert second_params["ver"] == "v_new"
-
-    def test_retire_happens_before_promote(self, svc, mock_engine):
-        """Retire must come first to avoid two simultaneous production rows."""
-        order = []
-        conn = mock_engine.begin.return_value.__enter__.return_value
-
-        def capture(sql, params=None):
-            sql_str = str(sql)
-            order.append("retire" if "retired" in sql_str else "promote")
-
-        conn.execute.side_effect = capture
-        svc.promote("v_new")
-        assert order == ["retire", "promote"]
+    def test_promotes_against_configured_model_name(self, svc, mock_client):
+        svc.promote("7")
+        kwargs = mock_client.transition_model_version_stage.call_args[1]
+        assert kwargs["name"] == svc._model_name
 
 
 # ── rollback ───────────────────────────────────────────────────────────────────
 
 class TestRollback:
-    def test_rollback_delegates_to_promote(self, svc, mock_engine):
+    def test_rollback_delegates_to_promote(self, svc):
         with patch.object(svc, "promote") as mock_promote:
             svc.rollback("v_previous")
         mock_promote.assert_called_once_with("v_previous")
 
-    def test_rollback_passes_correct_version(self, svc, mock_engine):
-        conn = mock_engine.begin.return_value.__enter__.return_value
-        svc.rollback("v_good_old_version")
-        # Second execute call should set v_good_old_version as production
-        second_params = conn.execute.call_args_list[1][0][1]
-        assert second_params["ver"] == "v_good_old_version"
+    def test_rollback_promotes_previous_version(self, svc, mock_client):
+        svc.rollback("v_good_old")
+        kwargs = mock_client.transition_model_version_stage.call_args[1]
+        assert kwargs["version"] == "v_good_old"
+        assert kwargs["stage"] == "Production"

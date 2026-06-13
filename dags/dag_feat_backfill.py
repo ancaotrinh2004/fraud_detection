@@ -43,7 +43,7 @@ _resources = k8s.V1ResourceRequirements(
 _volume_mounts = [
     k8s.V1VolumeMount(
         name="pipeline-config",
-        mount_path="/opt/airflow/config/pipeline_config.yaml",
+        mount_path="/opt/airflow/configs/pipeline_config.yaml",
         sub_path="pipeline_config.yaml",
         read_only=True,
     )

@@ -31,28 +31,40 @@ dagProcessor:
 
   extraVolumeMounts:
     - name: dags-cm
-      mountPath: /opt/airflow/dags/dag_bronze_ingest.py
-      subPath: dag_bronze_ingest.py
+      mountPath: /opt/airflow/dags/dag_batch_bronze.py
+      subPath: dag_batch_bronze.py
       readOnly: true
     - name: dags-cm
-      mountPath: /opt/airflow/dags/dag_silver_transform.py
-      subPath: dag_silver_transform.py
+      mountPath: /opt/airflow/dags/dag_batch_silver.py
+      subPath: dag_batch_silver.py
       readOnly: true
     - name: dags-cm
-      mountPath: /opt/airflow/dags/dag_gold_model.py
-      subPath: dag_gold_model.py
+      mountPath: /opt/airflow/dags/dag_batch_gold.py
+      subPath: dag_batch_gold.py
       readOnly: true
     - name: dags-cm
-      mountPath: /opt/airflow/dags/dag_feat_stream_30m.py
-      subPath: dag_feat_stream_30m.py
+      mountPath: /opt/airflow/dags/dag_batch_features.py
+      subPath: dag_batch_features.py
       readOnly: true
     - name: dags-cm
-      mountPath: /opt/airflow/dags/dag_feat_customer_90d.py
-      subPath: dag_feat_customer_90d.py
+      mountPath: /opt/airflow/dags/dag_stream_bronze.py
+      subPath: dag_stream_bronze.py
+      readOnly: true
+    - name: dags-cm
+      mountPath: /opt/airflow/dags/dag_stream_silver.py
+      subPath: dag_stream_silver.py
+      readOnly: true
+    - name: dags-cm
+      mountPath: /opt/airflow/dags/dag_stream_features.py
+      subPath: dag_stream_features.py
       readOnly: true
     - name: dags-cm
       mountPath: /opt/airflow/dags/dag_feat_unified.py
       subPath: dag_feat_unified.py
+      readOnly: true
+    - name: dags-cm
+      mountPath: /opt/airflow/dags/dag_feat_backfill.py
+      subPath: dag_feat_backfill.py
       readOnly: true
     - name: dags-cm
       mountPath: /opt/airflow/dags/dag_drift_monitor.py
@@ -74,12 +86,8 @@ dagProcessor:
       mountPath: /opt/airflow/dags/dag_ml_retrain_trigger.py
       subPath: dag_ml_retrain_trigger.py
       readOnly: true
-    - name: dags-cm
-      mountPath: /opt/airflow/dags/dag_feat_backfill.py
-      subPath: dag_feat_backfill.py
-      readOnly: true
     - name: pipeline-config
-      mountPath: /opt/airflow/config/pipeline_config.yaml
+      mountPath: /opt/airflow/configs/pipeline_config.yaml
       subPath: pipeline_config.yaml
       readOnly: true
 
@@ -101,28 +109,40 @@ workers:
           name: fraud-pipeline-config
     extraVolumeMounts:
       - name: dags-cm
-        mountPath: /opt/airflow/dags/dag_bronze_ingest.py
-        subPath: dag_bronze_ingest.py
+        mountPath: /opt/airflow/dags/dag_batch_bronze.py
+        subPath: dag_batch_bronze.py
         readOnly: true
       - name: dags-cm
-        mountPath: /opt/airflow/dags/dag_silver_transform.py
-        subPath: dag_silver_transform.py
+        mountPath: /opt/airflow/dags/dag_batch_silver.py
+        subPath: dag_batch_silver.py
         readOnly: true
       - name: dags-cm
-        mountPath: /opt/airflow/dags/dag_gold_model.py
-        subPath: dag_gold_model.py
+        mountPath: /opt/airflow/dags/dag_batch_gold.py
+        subPath: dag_batch_gold.py
         readOnly: true
       - name: dags-cm
-        mountPath: /opt/airflow/dags/dag_feat_stream_30m.py
-        subPath: dag_feat_stream_30m.py
+        mountPath: /opt/airflow/dags/dag_batch_features.py
+        subPath: dag_batch_features.py
         readOnly: true
       - name: dags-cm
-        mountPath: /opt/airflow/dags/dag_feat_customer_90d.py
-        subPath: dag_feat_customer_90d.py
+        mountPath: /opt/airflow/dags/dag_stream_bronze.py
+        subPath: dag_stream_bronze.py
+        readOnly: true
+      - name: dags-cm
+        mountPath: /opt/airflow/dags/dag_stream_silver.py
+        subPath: dag_stream_silver.py
+        readOnly: true
+      - name: dags-cm
+        mountPath: /opt/airflow/dags/dag_stream_features.py
+        subPath: dag_stream_features.py
         readOnly: true
       - name: dags-cm
         mountPath: /opt/airflow/dags/dag_feat_unified.py
         subPath: dag_feat_unified.py
+        readOnly: true
+      - name: dags-cm
+        mountPath: /opt/airflow/dags/dag_feat_backfill.py
+        subPath: dag_feat_backfill.py
         readOnly: true
       - name: dags-cm
         mountPath: /opt/airflow/dags/dag_drift_monitor.py
@@ -144,12 +164,8 @@ workers:
         mountPath: /opt/airflow/dags/dag_ml_retrain_trigger.py
         subPath: dag_ml_retrain_trigger.py
         readOnly: true
-      - name: dags-cm
-        mountPath: /opt/airflow/dags/dag_feat_backfill.py
-        subPath: dag_feat_backfill.py
-        readOnly: true
       - name: pipeline-config
-        mountPath: /opt/airflow/config/pipeline_config.yaml
+        mountPath: /opt/airflow/configs/pipeline_config.yaml
         subPath: pipeline_config.yaml
         readOnly: true
 
@@ -190,11 +206,20 @@ env:
     value: "fraud_minio_user"
   - name: MINIO_SECRET_KEY
     value: "fraud_minio_pass"
-  # ── DataHub lineage backend ───────────────────────────────────────────────
-  - name: AIRFLOW__LINEAGE__BACKEND
-    value: "datahub_provider.lineage.datahub.DatahubLineageBackend"
-  - name: AIRFLOW__LINEAGE__DATAHUB_KWARGS
-    value: '{"datahub_conn_id": "datahub_rest_default"}'
-  # Airflow connection for DataHub GMS (cluster-internal URL)
-  - name: AIRFLOW_CONN_DATAHUB_REST_DEFAULT
-    value: "http://datahub-datahub-gms.datahub.svc.cluster.local:8080"
+  # ── DataHub lineage — DISABLED until DataHub is deployed ───────────────────
+  # The acryl-datahub-airflow-plugin (v2 listener) auto-enables when the package
+  # is installed and tries to emit lineage to DataHub GMS on every task. With
+  # DataHub not deployed this only produces NameResolutionError spam and ~10s
+  # task hangs, so the listener is turned off here.
+  # Data governance (GE contracts / Data Docs) does NOT depend on this plugin;
+  # data lineage is still visible via Airflow's native Assets graph.
+  # To re-enable after DataHub is up: set ENABLED=true and uncomment the
+  # connection + lineage backend below.
+  - name: AIRFLOW__DATAHUB__ENABLED
+    value: "false"
+  # - name: AIRFLOW__LINEAGE__BACKEND
+  #   value: "datahub_provider.lineage.datahub.DatahubLineageBackend"
+  # - name: AIRFLOW__LINEAGE__DATAHUB_KWARGS
+  #   value: '{"datahub_conn_id": "datahub_rest_default"}'
+  # - name: AIRFLOW_CONN_DATAHUB_REST_DEFAULT
+  #   value: "http://datahub-datahub-gms.datahub.svc.cluster.local:8080"

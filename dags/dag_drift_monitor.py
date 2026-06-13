@@ -1,4 +1,8 @@
-"""Drift monitoring DAG — runs daily to track f_customer_avg_txn_amount_90d PSI."""
+"""Drift monitoring DAG — runs daily; computes weekly PSI for all 11 unified
+features plus prediction-score drift, writes health/alert tables, and pushes
+per-feature PSI + a run-status gauge to the Pushgateway. Alerting is handled by
+Prometheus alert rules (infra/k8s/fraud-drift-alerts.yaml) → Alertmanager →
+Discord, NOT by code."""
 
 from datetime import timedelta
 from airflow.decorators import dag, task

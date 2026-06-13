@@ -1,19 +1,24 @@
-# Local development dependencies (data generation, notebooks)
+# Local dev + CI deps: data generation, validation scripts, and the pytest suite.
+# Jenkins Track A/B install the test environment from this file. Container runtime
+# deps (kserve, etc.) live in infra/docker/*/requirements.txt.
 pandas
 numpy
 pyyaml
 pyarrow
 fastparquet
 tqdm
-boto3
+boto3                       # MinIO upload in scripts/setup/*.py
 acryl-datahub[datahub-rest]
+great-expectations>=1.3,<2
 psycopg2
 duckdb
+deltalake==0.25.4
 sqlalchemy
 prometheus_client
-pytest 
-scikit-learn 
-xgboost 
-fastapi
-uvicorn
-prometheus-fastapi-instrumentator
+requests>=2.31              # Discord alerts in src/pipelines/utils/alerting.py
+pytest
+scikit-learn
+xgboost
+kafka-python
+mlflow==3.1.4
+datahub

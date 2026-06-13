@@ -86,8 +86,8 @@ ORDER BY table_name;
 SELECT
     'fact_transaction'           AS table_name,
     COUNT(*)                     AS row_count,
-    MIN(transaction_timestamp)::text AS min_value,
-    MAX(transaction_timestamp)::text AS max_value
+    MIN(transaction_ts)::text AS min_value,
+    MAX(transaction_ts)::text AS max_value
 FROM gold_fraud.fact_transaction
 
 UNION ALL
@@ -95,8 +95,8 @@ UNION ALL
 SELECT
     'fact_fraud_event',
     COUNT(*),
-    MIN(event_timestamp)::text,
-    MAX(event_timestamp)::text
+    MIN(event_ts)::text,
+    MAX(event_ts)::text
 FROM gold_fraud.fact_fraud_event
 
 ORDER BY table_name;
@@ -109,8 +109,8 @@ ORDER BY table_name;
 SELECT
     'obt_transaction_fraud_summary' AS table_name,
     COUNT(*)                        AS row_count,
-    MIN(transaction_timestamp)::text AS min_value,
-    MAX(transaction_timestamp)::text AS max_value
+    MIN(transaction_ts)::text AS min_value,
+    MAX(transaction_ts)::text AS max_value
 FROM gold_fraud.obt_transaction_fraud_summary;
 
 
@@ -121,8 +121,8 @@ FROM gold_fraud.obt_transaction_fraud_summary;
 SELECT
     'feat_customer_90d'          AS table_name,
     COUNT(*)                     AS row_count,
-    MIN(event_timestamp)::text   AS min_value,
-    MAX(event_timestamp)::text   AS max_value
+    MIN(event_ts)::text   AS min_value,
+    MAX(event_ts)::text   AS max_value
 FROM gold_fraud.feat_customer_90d
 
 UNION ALL
@@ -130,8 +130,8 @@ UNION ALL
 SELECT
     'feat_stream_30m',
     COUNT(*),
-    MIN(event_timestamp)::text,
-    MAX(event_timestamp)::text
+    MIN(event_ts)::text,
+    MAX(event_ts)::text
 FROM gold_fraud.feat_stream_30m
 
 UNION ALL
@@ -139,8 +139,8 @@ UNION ALL
 SELECT
     'feat_customer_unified',
     COUNT(*),
-    MIN(event_timestamp)::text,
-    MAX(event_timestamp)::text
+    MIN(event_ts)::text,
+    MAX(event_ts)::text
 FROM gold_fraud.feat_customer_unified
 
 ORDER BY table_name;
@@ -166,17 +166,19 @@ LIMIT 20;
 
 -- ── Fraud Stats Summary ───────────────────────────────────
 \echo ''
-\echo '--- FRAUD STATS (fact_transaction) ---'
+\echo '--- FRAUD STATS (fact_transaction ⋈ ml_fraud_label) ---'
 
 SELECT
-    COUNT(*)                                    AS total_transactions,
-    SUM(is_fraud)                               AS fraud_count,
-    ROUND(100.0 * SUM(is_fraud) / COUNT(*), 2)  AS fraud_rate_pct,
-    COUNT(DISTINCT customer_key)                AS distinct_customers,
-    COUNT(DISTINCT merchant_key)                AS distinct_merchants,
-    ROUND(SUM(amount)::numeric, 0)              AS total_amount,
-    ROUND(AVG(amount)::numeric, 2)              AS avg_amount
-FROM gold_fraud.fact_transaction;
+    COUNT(*)                                        AS total_transactions,
+    SUM(l.label)                                    AS fraud_count,
+    ROUND(100.0 * SUM(l.label) / COUNT(*), 2)       AS fraud_rate_pct,
+    COUNT(DISTINCT ft.customer_key)                 AS distinct_customers,
+    COUNT(DISTINCT ft.merchant_key)                 AS distinct_merchants,
+    ROUND(SUM(ft.amount_base)::numeric, 0)          AS total_amount_base,
+    ROUND(AVG(ft.amount_base)::numeric, 2)          AS avg_amount_base
+FROM gold_fraud.fact_transaction ft
+LEFT JOIN gold_fraud.ml_fraud_label l
+    ON l.transaction_id = ft.transaction_id;
 
 
 -- ── OBT Derived Flags Summary ─────────────────────────────
@@ -185,7 +187,7 @@ FROM gold_fraud.fact_transaction;
 
 SELECT
     COUNT(*)                                        AS total_rows,
-    SUM(is_fraud)                                   AS fraud_count,
+    SUM(fraud_label)                                AS fraud_count,
     SUM(is_cross_border)                            AS cross_border_count,
     SUM(is_night_transaction)                       AS night_txn_count,
     SUM(is_high_value)                              AS high_value_count,

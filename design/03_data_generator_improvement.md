@@ -2,254 +2,130 @@
 
 ## 1. Objective
 
-Extend the data generator from `01_data_generator.md` with **feature drift simulation**.
+Extend the generator (01_data_generator.md) with **feature drift** simulation.
 
 Goals:
-
-- Simulate how transaction amount distributions change over time (fraud pattern evolution).
-- Test feature store monitoring and drift detection in the Gold layer.
+- Simulate how feature distributions change over time (fraud-pattern evolution).
+- Test feature-store monitoring and drift detection in the Gold layer.
 - Create a Gold label table for ML training.
-- Join label + feature tables to produce the training table used in `04_ml_design.md`.
-- Demonstrate covariate drift: input feature distribution changes while fraud logic remains the same.
+- Join label + feature tables into the training table used in 04.1_ml_design.md.
+- Demonstrate covariate drift: input distribution changes while the fraud rule stays fixed.
 
 ---
 
 ## 2. What is Feature Drift?
 
-Feature drift occurs when the statistical distribution of a computed feature changes over time, potentially degrading ML model performance.
+Feature drift: the distribution of a computed feature changes over time, degrading a model trained on the old distribution.
 
-In fraud detection, drift is common because:
-- Fraudsters adapt their behaviour (higher transaction amounts, new patterns).
-- Economic changes shift normal customer spending (inflation, promotions).
-- New merchant categories or payment channels change the transaction mix.
-
-Example: `f_customer_avg_txn_amount_90d` baseline mean = 907,483 VND/transaction. After drift: mean = 1,181,214 VND (+30%). A fraud model trained on baseline data would under-score high-amount transactions that are now normal — increasing false positives.
+Example: `f_customer_avg_txn_amount_90d` baseline mean ≈ 907k VND. After drift ≈ 1.18M VND (+30%). A model trained on the baseline under-scores high-amount transactions that are now normal, raising false positives.
 
 ---
 
 ## 3. Drift Scenarios: Pick At Least One
 
 ### Scenario A: Customer Transaction Frequency Drift
-
-What changes:
-- Transaction frequency increases from 2 tx/month to 3 tx/month (campaign or seasonal effect).
-
-How to inject:
-- Increase transaction creation rate by 50% after `drift_start_date`.
-
-Feature affected:
-- `f_customer_total_txn_90d` will increase.
+- **Change**: 2 → 3 tx/customer/month after `drift_start_date`. **Inject**: +50% transaction rate. **Feature**: `f_customer_total_txn_90d` ↑.
 
 ### Scenario B: Transaction Amount Drift ✅ (Chosen)
-
-What changes:
-- Average transaction amount increases by 30% after `drift_start_date` (economic inflation or fraud ring using higher-value merchants).
-- Drift is gradual: ramps up over 30 days to simulate organic change, not an abrupt jump.
-
-How to inject:
-- Multiply transaction `amount` by a time-varying multiplier after `drift_start_date`.
-- Gradual mode: multiplier = `1.0 + (1.30 − 1.0) × min((days_since_drift_start / ramp_days), 1.0)`.
-- Abrupt mode: multiplier = 1.30 immediately at `drift_start_date`.
-
-Feature affected:
-- `f_customer_avg_txn_amount_90d` will increase ~30% by end of ramp.
-
-Gold monitoring:
-- Track weekly PSI of raw `amount` distribution in `fact_transaction` vs baseline (first 60 days).
-- Alert when PSI > 0.025 (calibrated for lognormal transaction amount distribution — see Section 5).
+- **Change**: average amount +30% after `drift_start_date`, ramped over 30 days (gradual). **Inject**: multiply `amount` by a time-varying factor `1.0 + 0.30 × min(days_since_drift / ramp_days, 1)`. **Feature**: `f_customer_avg_txn_amount_90d` ↑ ~30%.
+- **Why B**: transaction amount is the strongest fraud signal (fraud rings inflate amounts before a card is blocked); drift flows end-to-end (generator → Bronze → Silver → Gold → feature store → drift monitor), exercising the whole stack with one realistic covariate shift.
 
 ### Scenario C: Merchant Category Drift
-
-What changes:
-- Shift in merchant category mix: grocery 40% → 20%, electronics 20% → 45%.
-
-How to inject:
-- Change merchant category sampling weights after `drift_start_date`.
-
-Feature affected:
-- `f_customer_distinct_merchants_90d` and fraud rate correlation.
+- **Change**: category mix shift (grocery 40→20%, electronics 20→45%). **Feature**: `f_customer_distinct_merchants_90d` + fraud-rate correlation.
 
 ---
 
-## 4. Why Scenario B?
+## 4. Drift Configuration Parameters
 
-Scenario B was chosen because transaction amount is the single most important signal in fraud detection:
-
-1. **Fraud rings inflate amounts** — stolen credentials are used for high-value purchases before being blocked.
-2. **Realistic temporal pattern** — amount inflation is gradual (economic) or abrupt (fraud campaign). Both modes are supported.
-3. **Clear monitoring signal** — PSI on the amount distribution directly measures the covariate shift that matters most to the fraud model.
-4. **End-to-end testability** — drift is injected at generator level, flows through Bronze → Silver → Gold → feature store → drift monitor, validating the full pipeline.
-
----
-
-## 5. Drift Configuration Parameters
-
-Added to `config/generate_config.yaml`:
+Added to `configs/generate_config.yaml`:
 
 ```yaml
 # Feature drift — Scenario B: Transaction Amount Drift
 drift_enabled: true
 drift_start_date: "2025-08-01"
-drift_mode: "gradual"          # gradual: ramp up over drift_ramp_days; abrupt: instant jump
+drift_mode: "gradual"          # gradual: ramp over drift_ramp_days; abrupt: instant
 scenario_B_amount: true
-amount_drift_multiplier: 1.30  # 30% increase after drift_start_date
-drift_ramp_days: 30            # days to reach full multiplier (gradual mode only)
+amount_drift_multiplier: 1.30  # +30% after drift_start_date
+drift_ramp_days: 30
 ```
-
-**PSI threshold note:** Transaction amounts follow a lognormal(13, 1.2) distribution with very high variance (std ≈ 1.8× mean). A 30% mean shift produces PSI ≈ 0.04, well below the credit-score standard of 0.15. The threshold was calibrated to **0.025** based on the observed stable-period PSI (< 0.001) versus post-drift PSI (0.027–0.045), giving a clean separation with no false positives.
 
 ---
 
-## 6. Example Output File
+## 5. Drift Detection & Alerting (implemented)
 
-File: `data/drift_validation_report.csv`
+The `drift_monitor` pipeline (`src/pipelines/features/drift_monitor.py`, DAG `dag_drift_monitor`) computes **weekly PSI** for all 11 `feat_customer_unified` features **plus the prediction score**, using quantile bins against a 60-day baseline.
 
-```
-date        | feature_name                      | mean_value   | psi_vs_baseline | drift_status
-2025-06-03  | f_customer_avg_txn_amount_90d     | 907,483      | 0.0000          | baseline
-2025-07-15  | f_customer_avg_txn_amount_90d     | 902,593      | 0.0001          | stable
-2025-08-12  | f_customer_avg_txn_amount_90d     | 988,001      | 0.0040          | stable
-2025-08-19  | f_customer_avg_txn_amount_90d     | 1,038,797    | 0.0129          | ramp_up
-2025-08-26  | f_customer_avg_txn_amount_90d     | 1,110,894    | 0.0267          | detected ⚠
-2025-09-02  | f_customer_avg_txn_amount_90d     | 1,190,816    | 0.0448          | detected ⚠
-2025-09-30  | f_customer_avg_txn_amount_90d     | 1,168,350    | 0.0442          | detected ⚠
-```
+| PSI | Severity |
+|---|---|
+| ≥ 0.10 | Warning |
+| ≥ 0.20 | Critical |
 
-Full report: 18 weekly windows — 10 stable, 2 ramp_up, **6 detected**.
+**Alerting is rule-based, not code.** The pipeline only pushes metrics (`fraud_drift_psi_<feature>`, `fraud_drift_run_status`) to the Pushgateway. Prometheus scrapes them; the `fraud-drift-alerts` PrometheusRule evaluates the thresholds and Alertmanager routes `category: drift` alerts to **Discord** (native `discord_configs`). See 04.1 §7 and `infra/k8s/fraud-drift-alerts.yaml`.
+
+**Observed result** (Scenario B drift, real run): `f_customer_avg_txn_amount_90d` PSI ≈ **0.30 (critical)** — the injected amount drift is clearly detected. Other features also breach due to the offline distribution shifts: `f_customer_foreign_txn_ratio_90d` 1.84, `f_customer_total_txn_90d` 1.72, `f_customer_distinct_merchants_90d` 1.72 (critical); `f_customer_decline_rate_90d` 0.15, `f_customer_night_txn_ratio_90d` 0.12 (warning).
 
 ---
 
-## 7. Gold Layer Monitoring Tables
+## 6. Gold Layer Monitoring & Label/Training Tables
 
 ### Table 1: agg_feature_health_daily
-
-Tracks weekly PSI of `amount` distribution vs baseline (first 60 days of transactions).
-
-Schema:
+Per-feature, per-window health. The drift monitor upserts one row per `(monitoring_date, feature_name)`.
 
 | Column | Type | Description |
-|--------|------|-------------|
-| monitoring_date | DATE | End date of the weekly window |
-| feature_name | VARCHAR | `f_customer_avg_txn_amount_90d` |
-| mean_value | NUMERIC | Weekly mean amount (VND) |
-| stddev_value | NUMERIC | Weekly stddev of amount |
-| psi_vs_baseline | NUMERIC | PSI vs first 60-day baseline |
-| alert_flag | BOOLEAN | True when PSI > 0.025 |
-
-Sample data:
-
-```
-monitoring_date | mean_value  | psi_vs_baseline | alert_flag
-2025-06-03      | 907,483     | 0.0000          | false
-2025-08-26      | 1,110,894   | 0.0267          | true
-2025-09-02      | 1,190,816   | 0.0448          | true
-2025-09-30      | 1,168,350   | 0.0442          | true
-```
-
-Total rows: 18 (weekly windows from Jun to Sep 2025).
+|---|---|---|
+| monitoring_date | DATE | window end date |
+| feature_name | VARCHAR | monitored feature |
+| mean_value / stddev_value | NUMERIC | window stats |
+| psi_vs_baseline | NUMERIC | PSI vs 60-day baseline |
+| alert_flag | BOOLEAN | PSI ≥ 0.10 |
 
 ### Table 2: feature_drift_alerts
-
-Created when PSI exceeds threshold. One row per alerted week.
-
-Schema:
+One row per drifted window (PSI ≥ 0.10).
 
 | Column | Type | Description |
-|--------|------|-------------|
-| alert_date | DATE | Week end date |
-| feature_name | VARCHAR | Monitored feature |
-| psi_value | NUMERIC | PSI for this window |
-| mean_before | NUMERIC | Baseline mean (VND) |
-| mean_after | NUMERIC | Window mean (VND) |
-| action | TEXT | Recommended action |
-
-Sample data:
-
-```
-alert_date  | psi_value | mean_before | mean_after | action
-2025-08-26  | 0.0267    | 907,483     | 1,110,894  | Amount drift detected (PSI=0.027): weekly mean shifted from 907,483 to 1,110,894. Verify Scenario B amount multiplier impact.
-2025-09-02  | 0.0448    | 907,483     | 1,190,816  | Amount drift detected (PSI=0.045): weekly mean shifted from 907,483 to 1,190,816. Verify Scenario B amount multiplier impact.
-```
-
-Total alerts: **6** (Aug 26, Sep 2, 9, 16, 23, 30).
+|---|---|---|
+| alert_date | DATE | window end |
+| feature_name | VARCHAR | feature |
+| psi_value | NUMERIC | window PSI |
+| mean_before / mean_after | NUMERIC | baseline vs window mean |
+| action | TEXT | recommended action |
 
 ### Table 3: ml_fraud_label
-
-Label-only table in Gold zone. One row per transaction.
-
-Schema:
+Label-only Gold table, one row per transaction.
 
 | Column | Type | Description |
-|--------|------|-------------|
-| transaction_id | UUID | Primary key |
-| customer_id | VARCHAR | For joining features |
-| event_timestamp | TIMESTAMP | Transaction time — used for PIT join |
-| label | SMALLINT | 1 = fraud, 0 = legitimate |
-| created_ts | TIMESTAMP | Ingestion time |
+|---|---|---|
+| transaction_id | UUID | PK |
+| customer_id | VARCHAR | join key |
+| event_ts | TIMESTAMP | transaction time — **point-in-time (PIT) join** key |
+| label | SMALLINT | `is_fraud` from `fact_transaction` (≥2 conditions) |
+| created_ts | TIMESTAMP | ingestion time |
 
-Rules:
-- `event_timestamp` is used for **point-in-time (PIT) join** with feature tables.
-- `label` = `is_fraud` from `fact_transaction` (derived from ≥ 2 fraud conditions met).
-- Total rows: **1,440,000** (all transactions, ~10% fraud rate → 144,000 fraud labels).
+Total rows ≈ **1,440,000** (~10% fraud → ~144,000 positives).
 
 ### Table 4: ml_fraud_training
+Built in two steps:
+1. **PIT join** `ml_fraud_label` against `feat_customer_90d` (latest snapshot with `event_ts ≤ label.event_ts`), plus context from `fact_transaction` / `dim_card`.
+2. **Per-transaction streaming features** from `stg_fraud_events` sliding windows (30 min / 1 h) at each transaction's exact `event_ts` (processed date-by-date to avoid OOM on ~34M events).
 
-Training table in Gold zone, created in two steps:
-
-**Step 1 — PIT join** of `ml_fraud_label` against `feat_customer_90d` for batch features, plus transaction context from `fact_transaction` and `dim_card`.
-
-**Step 2 — Per-transaction streaming features** computed directly from `stg_fraud_events` sliding windows (30 min / 1 h) at each transaction's actual timestamp. Processes date-by-date (loads 2 event partitions at a time) to avoid OOM on 33.5M events.
-
-> Note: streaming features are computed from `stg_fraud_events` at each transaction's exact timestamp, not from the `feat_stream_30m` snapshot table. This gives point-in-time accurate signal rather than a daily snapshot average.
-
-Schema:
-
-| Column | Type | Source |
-|--------|------|--------|
-| transaction_id | UUID | ml_fraud_label |
-| customer_id | VARCHAR | ml_fraud_label |
-| event_timestamp | TIMESTAMP | ml_fraud_label |
-| label | SMALLINT | ml_fraud_label |
-| f_customer_total_txn_90d | NUMERIC | feat_customer_90d (PIT join) |
-| f_customer_avg_txn_amount_90d | NUMERIC | feat_customer_90d (PIT join) |
-| f_customer_distinct_merchants_90d | NUMERIC | feat_customer_90d (PIT join) |
-| f_customer_decline_rate_90d | NUMERIC | feat_customer_90d (PIT join) |
-| f_customer_foreign_txn_ratio_90d | NUMERIC | feat_customer_90d (PIT join) |
-| f_customer_night_txn_ratio_90d | NUMERIC | feat_customer_90d (PIT join) |
-| f_stream_otp_failed_count_30m | NUMERIC | stg_fraud_events (sliding window) |
-| f_stream_decline_count_30m | NUMERIC | stg_fraud_events (sliding window) |
-| f_stream_txn_velocity_1h | NUMERIC | stg_fraud_events (sliding window) |
-| f_stream_new_merchant_flag | SMALLINT | stg_fraud_events (sliding window) |
-| f_stream_burst_activity_flag | SMALLINT | stg_fraud_events (sliding window) |
-| feature_snapshot_ts | TIMESTAMP | feat_customer_90d snapshot time |
-| txn_amount | NUMERIC | fact_transaction — raw amount for `txn_amount_ratio` |
-| txn_hour | SMALLINT | EXTRACT(HOUR FROM event_timestamp) — for `is_night_txn` |
-| is_declined_txn | SMALLINT | fact_transaction.is_declined — fraud condition |
-| is_foreign_txn | SMALLINT | ip_country ≠ card_country — fraud condition |
-| created_ts | TIMESTAMP | Pipeline ingestion time |
-
-PIT join logic (Step 1):
+Columns: `transaction_id`, `customer_id`, `event_ts`, `label`, the 6 `f_customer_*_90d` features, the 5 `f_stream_*` features, plus `txn_amount`, `txn_hour`, `is_declined_txn`, `is_foreign_txn`, `created_ts` — 17 model features total (15 stored + derived `txn_amount_ratio`, `is_night_txn`).
 
 ```sql
 LEFT JOIN LATERAL (
-    SELECT * FROM gold_fraud.feat_customer_90d u
-    WHERE u.customer_id = l.customer_id
-      AND u.event_timestamp <= l.event_timestamp
-    ORDER BY u.event_timestamp DESC LIMIT 1
+  SELECT * FROM gold_fraud.feat_customer_90d u
+  WHERE u.customer_id = l.customer_id AND u.event_ts <= l.event_ts
+  ORDER BY u.event_ts DESC LIMIT 1
 ) f ON TRUE
-LEFT JOIN gold_fraud.fact_transaction t ON t.transaction_id = l.transaction_id
-LEFT JOIN gold_fraud.dim_card dc ON dc.card_key = t.card_key
 ```
-
-Total rows: **1,440,000** (same as ml_fraud_label, ~10% fraud → 144,000 positive labels).
 
 ---
 
-## 8. Deliverables
+## 7. Deliverables
 
-1. **Data generator code** — `src/generator/offline/transactions.py` with Scenario B drift injection; `config/generate_config.yaml` with drift parameters.
-2. **Drift validation report** — `data/drift_validation_report.csv` (18 weekly windows, 6 detected).
-3. **Gold monitoring tables** — `agg_feature_health_daily` (18 rows), `feature_drift_alerts` (6 rows) populated with PSI values.
-4. **Gold label table** — `ml_fraud_label` (1,440,000 rows) with `event_timestamp` and `label`.
-5. **Gold training table** — `ml_fraud_training` (1,440,000 rows) created by PIT join of label + feature snapshot.
-6. **Brief explanation** — Scenario B chosen: 30% gradual transaction amount drift from 2025-08-01. Feature `f_customer_avg_txn_amount_90d` increases ~30% by Sep 2025. PSI threshold calibrated to 0.025 for lognormal distribution (standard 0.15 is designed for credit scores). 6 alert weeks detected from Aug 26 – Sep 30.
+1. **Generator code** — `src/generator/offline/transactions.py` (Scenario B injection) + drift params in `configs/generate_config.yaml`.
+2. **Drift detection** — `drift_monitor` pipeline computing weekly PSI for 11 features + score.
+3. **Gold monitoring tables** — `agg_feature_health_daily`, `feature_drift_alerts` populated.
+4. **Rule-based alerting** — `fraud-drift-alerts` PrometheusRule → Alertmanager → Discord (no code alerts).
+5. **Gold label table** — `ml_fraud_label` (~1.44M rows, `event_ts` + `label`).
+6. **Gold training table** — `ml_fraud_training` (~1.44M rows) via PIT label+feature join.
+7. **Explanation** — Scenario B: 30% gradual amount drift from 2025-08-01; `f_customer_avg_txn_amount_90d` PSI ≈ 0.30 (critical) → drift detected end-to-end.

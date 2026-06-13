@@ -1,13 +1,13 @@
 """
 src/pipelines/silver/clean_events.py
 Bronze raw_fraud_events → Silver stg_fraud_events.
-Dedup by (event_id, event_timestamp).
+Dedup by (event_id, event_ts).
 
 Memory-safe design:
 - Reads one event_date partition at a time via s3fs (bypasses delta-rs full-table scan).
 - Compares bronze vs silver partition dates; only appends missing partitions.
 - Reprocesses partitions within the last LATE_ARRIVAL_DAYS days to reconcile late-arriving
-  events (events with old event_timestamp but recent created_ts that arrived after their
+  events (events with old event_ts but recent created_ts that arrived after their
   partition was first written to silver).
 - Never merges against the full target table — avoids O(n^2) memory growth.
 Scheduled: every 5 minutes.
@@ -36,7 +36,7 @@ VALID_EVENT_TYPES = {
     "transaction_declined", "otp_request", "otp_failed",
 }
 # Reprocess silver partitions within this window on every run to capture
-# late-arriving events (events with event_timestamp in the past that arrived
+# late-arriving events (events with event_ts in the past that arrived
 # in bronze after the silver partition was first written).
 LATE_ARRIVAL_DAYS = 2
 
@@ -44,7 +44,7 @@ LATE_ARRIVAL_DAYS = 2
 def _dedup(df: pd.DataFrame) -> pd.DataFrame:
     return (
         df.sort_values("created_ts", ascending=False)
-        .drop_duplicates(subset=["event_id", "event_timestamp"], keep="first")
+        .drop_duplicates(subset=["event_id", "event_ts"], keep="first")
     )
 
 
@@ -57,7 +57,7 @@ def _coerce_object_nulls(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _reject_bad_rows(df: pd.DataFrame, dead_letter_base: str, start_ts: datetime):
-    mask_bad = df["event_id"].isna() | df["event_timestamp"].isna() | df["customer_id"].isna()
+    mask_bad = df["event_id"].isna() | df["event_ts"].isna() | df["customer_id"].isna()
     mask_bad |= ~df["event_type"].isin(VALID_EVENT_TYPES)
 
     bad_df  = df[mask_bad].copy()
@@ -231,7 +231,7 @@ def run(cfg: dict | None = None) -> None:
                         f"(bronze={len(df) - len(existing):,} + existing={len(existing):,})."
                     )
 
-            df["event_timestamp"] = pd.to_datetime(df["event_timestamp"])
+            df["event_ts"] = pd.to_datetime(df["event_ts"])
             df["created_ts"]      = pd.to_datetime(df["created_ts"])
             total_input += len(df)
 
@@ -244,11 +244,11 @@ def run(cfg: dict | None = None) -> None:
             df["is_declined"]            = (df["event_type"] == "transaction_declined").astype("Int8")
             df["is_transaction_attempt"] = (df["event_type"] == "transaction_attempt").astype("Int8")
             df["stg_processed_ts"]       = datetime.utcnow()
-            df["event_date"]             = df["event_timestamp"].dt.date.astype(str)
+            df["event_date"]             = df["event_ts"].dt.date.astype(str)
 
             qr = QualityResult(pipeline=PIPELINE_NAME)
             check_not_empty(df, qr)
-            check_unique(df, ["event_id", "event_timestamp"], qr)
+            check_unique(df, ["event_id", "event_ts"], qr)
             check_no_nulls(df, ["event_id", "event_type", "customer_id"], qr)
             if not qr.passed:
                 raise ValueError(f"Quality checks failed for {date_val}:\n{qr.summary()}")

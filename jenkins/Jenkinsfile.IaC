@@ -4,10 +4,12 @@
 //   infra/helm/monitoring/**                   → helm upgrade kube-prometheus-stack 85.2.0
 //   infra/helm/airflow/**                      → helm upgrade airflow 1.21.0 (values-only)
 //   infra/helm/datahub/prerequisites-values.yaml → helm upgrade datahub-prerequisites 0.3.0
-//   infra/helm/datahub/datahub-values.yaml     → helm upgrade datahub 0.9.12
+//   infra/helm/datahub/datahub-values.yaml     → helm upgrade datahub 1.0.0
 //   infra/k8s/fraud-pipeline-secret.yaml       → kubectl apply secret
 //   infra/k8s/pushgateway.yaml                 → kubectl apply + rollout status
 //   infra/k8s/fraud-inference-monitor.yaml     → kubectl apply ServiceMonitor
+//   infra/k8s/fraud-drift-alerts.yaml          → kubectl apply PrometheusRule (drift → Discord)
+//   infra/k8s/grafana-fraud-dashboard.yaml     → kubectl apply Grafana dashboard ConfigMap
 //   infra/k8s/fraud-inference.yaml             → kubectl apply InferenceService spec
 //   infra/k8s/net-istio.yaml                   → kubectl apply Istio/Knative config
 //
@@ -76,7 +78,7 @@ spec:
         MONITORING_CHART_VER  = "85.2.0"
         AIRFLOW_CHART_VER     = "1.21.0"
         DATAHUB_PREREQ_VER    = "0.3.0"
-        DATAHUB_CHART_VER     = "0.9.12"
+        DATAHUB_CHART_VER     = "1.0.0"
     }
 
     stages {
@@ -192,6 +194,8 @@ spec:
                         infra/k8s/fraud-pipeline-secret.yaml
                         infra/k8s/pushgateway.yaml
                         infra/k8s/fraud-inference-monitor.yaml
+                        infra/k8s/fraud-drift-alerts.yaml
+                        infra/k8s/grafana-fraud-dashboard.yaml
                         infra/k8s/fraud-inference.yaml
                         infra/k8s/net-istio.yaml
                     "
@@ -355,6 +359,29 @@ PYEOF
                     kubectl apply -f infra/k8s/fraud-inference-monitor.yaml
                     echo "ServiceMonitor applied"
                     kubectl get servicemonitor fraud-inference 2>/dev/null || true
+                """
+            }
+        }
+
+        stage('Apply Monitoring Extras') {
+            when {
+                allOf {
+                    branch 'main'
+                    anyOf {
+                        changeset "infra/k8s/fraud-drift-alerts.yaml"
+                        changeset "infra/k8s/grafana-fraud-dashboard.yaml"
+                        expression { env.RUN_DEPLOY == 'true' }
+                    }
+                }
+            }
+            steps {
+                sh """
+                    # Drift alert rules (PrometheusRule, needs the kube-prometheus-stack CRD)
+                    # and the Grafana dashboard ConfigMap (auto-loaded by the Grafana sidecar).
+                    kubectl apply -f infra/k8s/fraud-drift-alerts.yaml
+                    kubectl apply -f infra/k8s/grafana-fraud-dashboard.yaml
+                    echo "Drift PrometheusRule + Grafana dashboard applied"
+                    kubectl get prometheusrule fraud-drift-alerts -n ${env.MONITORING_NS} 2>/dev/null || true
                 """
             }
         }

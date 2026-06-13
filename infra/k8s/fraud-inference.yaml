@@ -7,7 +7,7 @@ spec:
   predictor:
     containers:
     - name: kserve-container
-      image: ancaotrinh/fraud-inference:v1
+      image: ancaotrinh/fraud-inference:latest 
       imagePullPolicy: Always
       ports:
       - containerPort: 8080
@@ -32,6 +32,22 @@ spec:
         value: "fraud_minio_user"
       - name: MINIO_SECRET_KEY
         value: "fraud_minio_pass"
+      - name: MLFLOW_TRACKING_URI
+        value: "http://mlflow.fraud-infra.svc.cluster.local:5000"
+      - name: MLFLOW_S3_ENDPOINT_URL
+        value: "http://fraud-minio.fraud-infra.svc.cluster.local:9000"
+      - name: AWS_ACCESS_KEY_ID
+        value: "fraud_minio_user"
+      - name: AWS_SECRET_ACCESS_KEY
+        value: "fraud_minio_pass"
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: "http://jaeger.fraud-infra.svc.cluster.local:4317"
+      - name: DISCORD_WEBHOOK_URL
+        valueFrom:
+          secretKeyRef:
+            name: fraud-pipeline-secret
+            key: DISCORD_WEBHOOK_URL
+            optional: true
       resources:
         requests:
           cpu: "500m"

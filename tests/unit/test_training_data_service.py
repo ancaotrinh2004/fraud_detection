@@ -32,12 +32,12 @@ class TestReadTrainingTable:
             result = svc.read_training_table(engine)
         assert isinstance(result, pd.DataFrame)
 
-    def test_event_timestamp_converted_to_datetime(self, svc, training_df):
-        training_df["event_timestamp"] = training_df["event_timestamp"].astype(str)
+    def test_event_ts_converted_to_datetime(self, svc, training_df):
+        training_df["event_ts"] = training_df["event_ts"].astype(str)
         engine = MagicMock()
         with patch("src.pipelines.ml.services.pd.read_sql", return_value=training_df):
             result = svc.read_training_table(engine)
-        assert pd.api.types.is_datetime64_any_dtype(result["event_timestamp"])
+        assert pd.api.types.is_datetime64_any_dtype(result["event_ts"])
 
     def test_queries_correct_table(self, svc, training_df):
         engine = MagicMock()
@@ -45,7 +45,7 @@ class TestReadTrainingTable:
             svc.read_training_table(engine)
         sql_call = mock_sql.call_args[0][0]
         assert "ml_fraud_training" in sql_call
-        assert "ORDER BY event_timestamp" in sql_call
+        assert "ORDER BY event_ts" in sql_call
 
     def test_passes_engine_to_read_sql(self, svc, training_df):
         engine = MagicMock()
@@ -75,8 +75,8 @@ class TestValidateSchema:
         with pytest.raises(ValueError, match="Missing columns"):
             svc.validate_schema(df)
 
-    def test_raises_when_event_timestamp_missing(self, svc, training_df):
-        df = training_df.drop(columns=["event_timestamp"])
+    def test_raises_when_event_ts_missing(self, svc, training_df):
+        df = training_df.drop(columns=["event_ts"])
         with pytest.raises(ValueError, match="Missing columns"):
             svc.validate_schema(df)
 
@@ -119,27 +119,27 @@ class TestGetSplitBoundaries:
 
     def test_boundaries_within_data_range(self, svc, training_df):
         b = svc.get_split_boundaries(training_df)
-        assert b["train_end"] >= training_df["event_timestamp"].min()
-        assert b["val_end"]   <= training_df["event_timestamp"].max()
+        assert b["train_end"] >= training_df["event_ts"].min()
+        assert b["val_end"]   <= training_df["event_ts"].max()
 
     def test_train_end_at_70pct_of_data(self, svc, training_df):
         n = len(training_df)
         b = svc.get_split_boundaries(training_df, train_frac=0.70)
-        sorted_ts = training_df["event_timestamp"].sort_values()
+        sorted_ts = training_df["event_ts"].sort_values()
         expected_idx = int(n * 0.70)
         assert b["train_end"] == sorted_ts.iloc[expected_idx]
 
     def test_val_end_at_85pct_of_data(self, svc, training_df):
         n = len(training_df)
         b = svc.get_split_boundaries(training_df, train_frac=0.70, val_frac=0.15)
-        sorted_ts = training_df["event_timestamp"].sort_values()
+        sorted_ts = training_df["event_ts"].sort_values()
         expected_idx = int(n * 0.85)
         assert b["val_end"] == sorted_ts.iloc[expected_idx]
 
     def test_custom_fractions(self, svc, training_df):
         b = svc.get_split_boundaries(training_df, train_frac=0.60, val_frac=0.20)
         n = len(training_df)
-        sorted_ts = training_df["event_timestamp"].sort_values()
+        sorted_ts = training_df["event_ts"].sort_values()
         assert b["train_end"] == sorted_ts.iloc[int(n * 0.60)]
         assert b["val_end"]   == sorted_ts.iloc[int(n * 0.80)]
 
@@ -159,11 +159,11 @@ class TestSplitByTime:
 
     def test_no_data_leakage_train_val(self, svc, training_df):
         train, val, _ = svc.split_by_time(training_df)
-        assert train["event_timestamp"].max() <= val["event_timestamp"].min()
+        assert train["event_ts"].max() <= val["event_ts"].min()
 
     def test_no_data_leakage_val_test(self, svc, training_df):
         _, val, test_split = svc.split_by_time(training_df)
-        assert val["event_timestamp"].max() <= test_split["event_timestamp"].min()
+        assert val["event_ts"].max() <= test_split["event_ts"].min()
 
     def test_train_is_largest_split_at_70pct(self, svc, training_df):
         train, val, test_split = svc.split_by_time(training_df)
@@ -197,7 +197,7 @@ class TestSplitByTime:
         # Shuffle the DataFrame — split should still be time-based
         shuffled = training_df.sample(frac=1, random_state=99).reset_index(drop=True)
         train, val, test_split = svc.split_by_time(shuffled)
-        assert train["event_timestamp"].max() <= val["event_timestamp"].min()
+        assert train["event_ts"].max() <= val["event_ts"].min()
 
 
 # ── handle_missing_features ────────────────────────────────────────────────────

@@ -1,0 +1,60 @@
+# Prometheus alert rules for feature/score drift + drift-monitor pipeline health.
+#
+# Source metrics are pushed by src/pipelines/features/drift_monitor.py to the
+# Pushgateway (job=drift_monitor_pipeline), scraped by Prometheus:
+#   fraud_drift_psi_<feature>   per-feature latest PSI (gauge)
+#   fraud_drift_run_status      1 = last run succeeded, 0 = failed
+#
+# The `release: kube-prom` label lets the kube-prometheus-stack operator pick up
+# this rule. Alertmanager (see infra/helm/monitoring/values.yaml) routes anything
+# with `category: drift` to Discord.
+#
+# Apply: kubectl apply -f infra/k8s/fraud-drift-alerts.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: fraud-drift-alerts
+  namespace: monitoring
+  labels:
+    release: kube-prom
+spec:
+  groups:
+    - name: fraud-drift
+      rules:
+        # label_replace lifts the feature name out of __name__ into a real
+        # `feature` label. Prometheus strips __name__ when building alerts, so
+        # without this the per-feature series collapse to one labelset and the
+        # rule errors with "same labelset after applying alert labels".
+        - alert: FraudFeatureDriftCritical
+          expr: 'label_replace({__name__=~"fraud_drift_psi_.+"} >= 0.2, "feature", "$1", "__name__", "fraud_drift_psi_(.+)")'
+          for: 1m
+          labels:
+            severity: critical
+            category: drift
+          annotations:
+            summary: "Critical feature drift: {{ $labels.feature }}"
+            description: >-
+              Feature {{ $labels.feature }} has PSI {{ $value | printf "%.3f" }}
+              (>= 0.2 critical) vs baseline.
+
+        - alert: FraudFeatureDriftWarning
+          expr: 'label_replace({__name__=~"fraud_drift_psi_.+"} >= 0.1 < 0.2, "feature", "$1", "__name__", "fraud_drift_psi_(.+)")'
+          for: 1m
+          labels:
+            severity: warning
+            category: drift
+          annotations:
+            summary: "Feature drift warning: {{ $labels.feature }}"
+            description: >-
+              Feature {{ $labels.feature }} has PSI {{ $value | printf "%.3f" }}
+              (>= 0.1 warning) vs baseline.
+
+        - alert: FraudDriftMonitorFailed
+          expr: "fraud_drift_run_status == 0"
+          for: 1m
+          labels:
+            severity: critical
+            category: drift
+          annotations:
+            summary: "Drift monitor pipeline failed"
+            description: "The drift_monitor pipeline's last run failed (fraud_drift_run_status == 0)."

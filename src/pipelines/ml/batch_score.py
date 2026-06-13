@@ -30,7 +30,7 @@ def run_batch_score(cfg: dict | None = None) -> None:
     start_ts  = datetime.now()
 
     model_svc    = ModelService(cfg)
-    registry_svc = ModelRegistryService(engine)
+    registry_svc = ModelRegistryService(cfg)
     scoring_svc  = ScoringService()
 
     logger.info(f"[{PIPELINE}] Starting batch scoring...")
@@ -49,7 +49,7 @@ def run_batch_score(cfg: dict | None = None) -> None:
         score_from = (datetime.now() - timedelta(days=2)).date()
         df = pd.read_sql(
             f"""
-            SELECT t.transaction_id, t.customer_id, t.event_timestamp,
+            SELECT t.transaction_id, t.customer_id, t.event_ts,
                    f.f_customer_total_txn_90d,
                    f.f_customer_avg_txn_amount_90d,
                    f.f_customer_distinct_merchants_90d,
@@ -61,9 +61,9 @@ def run_batch_score(cfg: dict | None = None) -> None:
                    f.f_stream_txn_velocity_1h,
                    f.f_stream_new_merchant_flag,
                    f.f_stream_burst_activity_flag,
-                   ft.amount                                          AS txn_amount,
-                   EXTRACT(HOUR FROM t.event_timestamp)::int         AS txn_hour,
-                   COALESCE(ft.is_declined, 0)                       AS is_declined_txn,
+                   ft.amount_base                                     AS txn_amount,
+                   EXTRACT(HOUR FROM t.event_ts)::int         AS txn_hour,
+                   CASE WHEN ds.status_name = 'declined' THEN 1 ELSE 0 END AS is_declined_txn,
                    CASE WHEN ft.ip_country IS NOT NULL
                              AND dc.card_country IS NOT NULL
                              AND LOWER(ft.ip_country) != LOWER(dc.card_country)
@@ -72,14 +72,16 @@ def run_batch_score(cfg: dict | None = None) -> None:
             LEFT JOIN LATERAL (
                 SELECT * FROM {SCHEMA}.feat_customer_unified u
                 WHERE u.customer_id = t.customer_id
-                  AND u.event_timestamp <= t.event_timestamp
-                ORDER BY u.event_timestamp DESC LIMIT 1
+                  AND u.event_ts <= t.event_ts
+                ORDER BY u.event_ts DESC LIMIT 1
             ) f ON TRUE
             LEFT JOIN {SCHEMA}.fact_transaction ft
                 ON ft.transaction_id = t.transaction_id
             LEFT JOIN {SCHEMA}.dim_card dc
                 ON dc.card_key = ft.card_key
-            WHERE t.event_timestamp >= %(score_from)s
+            LEFT JOIN {SCHEMA}.dim_transaction_status ds
+                ON ds.status_key = ft.status_key
+            WHERE t.event_ts >= %(score_from)s
             """,
             engine,
             params={"score_from": str(score_from)},

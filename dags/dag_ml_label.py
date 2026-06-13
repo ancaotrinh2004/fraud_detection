@@ -1,4 +1,18 @@
-"""ML label + training table DAG — runs daily after gold_model."""
+"""
+ML TRACK — Step 1/2
+dag_ml_label: Gold → ml_fraud_training
+
+Builds the point-in-time correct training table by joining:
+  - ml_fraud_label         (labels from silver stg_transactions, with label_ts/label_status)
+  - feat_customer_unified  (features: 90d batch + 30m streaming, snapshotted at txn time)
+  - fact_transaction       (txn context: amount_base, status, ip_country)
+
+Two steps run sequentially:
+  1. build_label    → ml_fraud_label    (label store; label is NOT in fact_transaction)
+  2. build_training → ml_fraud_training (PIT-joined with feat_customer_unified)
+
+Schedule: 0 7 * * *  (daily, after batch_gold completes at ~6:30)
+"""
 
 from datetime import timedelta
 from airflow.decorators import dag, task

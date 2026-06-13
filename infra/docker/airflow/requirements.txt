@@ -23,3 +23,15 @@ scikit-learn==1.6.1
 
 # Monitoring — push pipeline metrics to Prometheus Pushgateway
 prometheus_client
+
+# MLflow experiment tracking + model registry
+mlflow>=2.15.0
+
+# Kafka streaming (Bronze ingest + generator publish)
+kafka-python>=2.0.0
+
+# HTTP alerts (Discord webhook)
+requests>=2.31
+
+# Data governance — Great Expectations contract validation + Data Docs
+great-expectations>=1.3,<2

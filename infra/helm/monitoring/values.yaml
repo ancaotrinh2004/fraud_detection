@@ -144,7 +144,9 @@ prometheus:
               - pushgateway.monitoring.svc.cluster.local:9091
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Alertmanager — keep minimal, no external routing needed for coursework
+# Alertmanager — route drift alerts (category=drift, from fraud-drift-alerts
+# PrometheusRule) to Discord using native discord_configs (Alertmanager >= 0.25).
+# Everything else (incl. the Watchdog heartbeat) goes to the 'null' receiver.
 # ─────────────────────────────────────────────────────────────────────────────
 alertmanager:
   alertmanagerSpec:
@@ -155,6 +157,30 @@ alertmanager:
       limits:
         cpu: 100m
         memory: 128Mi
+
+  config:
+    route:
+      group_by: ["alertname", "category"]
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      receiver: "null"
+      routes:
+        - matchers: ["category = drift"]
+          receiver: discord
+        - matchers: ["alertname = Watchdog"]
+          receiver: "null"
+    receivers:
+      - name: "null"
+      - name: discord
+        discord_configs:
+          - webhook_url: "https://discord.com/api/webhooks/1512885679514849473/-cUfoZM6M3-qa8jm7XdgasxXT66ZAEp5dEKpzMy2biqKZrIw0iKxOp00OKDoxSUmHaoe"
+            send_resolved: true
+            title: '[{{ (index .Alerts 0).Labels.severity | toUpper }}] {{ .CommonLabels.alertname }}'
+            message: |-
+              {{ range .Alerts }}**{{ .Annotations.summary }}**
+              {{ .Annotations.description }}
+              {{ end }}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # kube-state-metrics and node-exporter — trim resources for Kind

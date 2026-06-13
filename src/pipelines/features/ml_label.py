@@ -28,7 +28,7 @@ def _compute_per_txn_streaming_features(txn_df: pd.DataFrame, events_df: pd.Data
     Compute per-transaction streaming features at actual transaction time.
 
     For each transaction row in txn_df (needs transaction_id, customer_id,
-    event_timestamp), count events from stg_fraud_events within sliding windows:
+    event_ts), count events from stg_fraud_events within sliding windows:
       - f_stream_otp_failed_count_30m  : otp_failed events in [txn_ts - 30min, txn_ts)
       - f_stream_decline_count_30m     : transaction_declined events in [txn_ts - 30min, txn_ts)
       - f_stream_txn_velocity_1h       : transaction_attempt events in [txn_ts - 1h, txn_ts)
@@ -44,7 +44,7 @@ def _compute_per_txn_streaming_features(txn_df: pd.DataFrame, events_df: pd.Data
     # Pre-group events by customer and event type
     def _build_ts_map(ev_df):
         return {
-            cid: g["event_timestamp"].sort_values().values.astype("int64")
+            cid: g["event_ts"].sort_values().values.astype("int64")
             for cid, g in ev_df.groupby("customer_id")
         }
 
@@ -56,16 +56,16 @@ def _compute_per_txn_streaming_features(txn_df: pd.DataFrame, events_df: pd.Data
     merch_ev = events_df[events_df["merchant_id"].notna()].copy()
     merch_map: dict = {}
     for cid, g in merch_ev.groupby("customer_id"):
-        g_sorted = g.sort_values("event_timestamp")
+        g_sorted = g.sort_values("event_ts")
         merch_map[cid] = (
-            g_sorted["event_timestamp"].values.astype("int64"),
+            g_sorted["event_ts"].values.astype("int64"),
             g_sorted["merchant_id"].values,
         )
 
     results = []
     for cid, txn_group in txn_df.groupby("customer_id"):
-        txn_sorted = txn_group.sort_values("event_timestamp")
-        txn_ts     = txn_sorted["event_timestamp"].values.astype("int64")
+        txn_sorted = txn_group.sort_values("event_ts")
+        txn_ts     = txn_sorted["event_ts"].values.astype("int64")
 
         otp_ts = otp_map.get(cid, _EMPTY)
         dec_ts = dec_map.get(cid, _EMPTY)
@@ -81,7 +81,7 @@ def _compute_per_txn_streaming_features(txn_df: pd.DataFrame, events_df: pd.Data
         vel_lo = np.searchsorted(vel_ts, txn_ts - W1H_NS, side="left")
 
         # burst_activity_flag from transaction timestamp
-        ts_pd = txn_sorted["event_timestamp"]
+        ts_pd = txn_sorted["event_ts"]
         burst = (
             ((ts_pd.dt.hour == 12) & (ts_pd.dt.minute <= 20)) |
             ((ts_pd.dt.hour == 22) & (ts_pd.dt.minute <= 20))
@@ -117,56 +117,91 @@ def _compute_per_txn_streaming_features(txn_df: pd.DataFrame, events_df: pd.Data
 
 
 def run_ml_label(cfg: dict | None = None) -> None:
-    """Populate ml_fraud_label from fact_transaction."""
+    """Build ml_fraud_label from silver stg_transactions — the label source of truth.
+
+    Labels arrive late in reality (chargeback / investigation), so the fact table
+    must NOT carry is_fraud. Here we read the label from silver and simulate a
+    realistic arrival delay:
+      • label_ts     = transaction time + delay (fraud: 1–90 days; legit: 90-day
+                       dispute window).
+      • label_status = matured (label_ts ≤ now) / confirmed (fraud, not yet matured)
+                       / suspected (presumed legit, dispute window still open).
+    Training should only use rows whose label_ts ≤ the as-of time (PIT-correct).
+
+    Reads date-by-date from silver partitions to stay memory-flat (~30M rows).
+    """
     if cfg is None:
         cfg = load_pipeline_config()
-    engine = get_sqlalchemy_engine(cfg)
-    start_ts = datetime.utcnow()
-    pipeline = "ml_label_pipeline"
+    from src.pipelines.gold.fact_transaction import (
+        _list_silver_partition_dates, _read_silver_partition,
+    )
 
-    logger.info(f"[{pipeline}] Building ml_fraud_label from fact_transaction...")
+    engine       = get_sqlalchemy_engine(cfg)
+    silver_base  = cfg["silver_base_path"]
+    storage_opts = get_storage_options(cfg)
+    start_ts     = datetime.utcnow()
+    pipeline     = "ml_label_pipeline"
+    rng          = np.random.default_rng(42)
+    now          = pd.Timestamp(start_ts)
+
+    _SRC_COLS = ["transaction_id", "customer_id", "transaction_ts", "is_fraud"]
+    logger.info(f"[{pipeline}] Building ml_fraud_label from silver stg_transactions...")
     try:
-        df = pd.read_sql(
-            f"""
-            SELECT
-                transaction_id,
-                customer_key,
-                transaction_timestamp   AS event_timestamp,
-                created_ts,
-                is_fraud                AS label
-            FROM {SCHEMA}.fact_transaction
-            """,
-            engine,
-        )
-
-        # Resolve customer_id from customer_key
-        dim = pd.read_sql(
-            f"SELECT customer_key, customer_id FROM {SCHEMA}.dim_customer WHERE is_current",
-            engine,
-        )
-        df = df.merge(dim, on="customer_key", how="left")
-        df = df[["transaction_id", "customer_id", "event_timestamp", "created_ts", "label"]]
-        df = df.dropna(subset=["customer_id"])
+        dates = _list_silver_partition_dates(silver_base, storage_opts)
+        if not dates:
+            raise ValueError("No partitions found in stg_transactions")
 
         with engine.begin() as conn:
             conn.execute(text(f"TRUNCATE {SCHEMA}.ml_fraud_label"))
-            rows = df.to_dict(orient="records")
-            chunk = 5000
-            for i in range(0, len(rows), chunk):
-                conn.execute(text(f"""
-                    INSERT INTO {SCHEMA}.ml_fraud_label
-                        (transaction_id, customer_id, event_timestamp, created_ts, label)
-                    VALUES (:transaction_id, :customer_id, :event_timestamp, :created_ts, :label)
-                    ON CONFLICT (transaction_id) DO NOTHING
-                """), rows[i: i + chunk])
 
-        log_run(pipeline, start_ts, datetime.utcnow(), "success", len(df), len(df), cfg=cfg)
-        logger.info(f"[{pipeline}] Done. {len(df):,} label rows written.")
+        total = fraud_total = 0
+        for date_val in dates:
+            df = _read_silver_partition(silver_base, date_val, storage_opts)
+            if df.empty:
+                continue
+            df = df[[c for c in _SRC_COLS if c in df.columns]].copy()
+            df = df.rename(columns={"transaction_ts": "event_ts", "is_fraud": "label"})
+            df["event_ts"] = pd.to_datetime(df["event_ts"], errors="coerce")
+            df = df.dropna(subset=["transaction_id", "customer_id", "event_ts"])
+            if df.empty:
+                continue
+            df["label"] = df["label"].fillna(0).astype(int)
+
+            # Simulated label-arrival delay (days).
+            delay = np.where(df["label"].values == 1,
+                             rng.integers(1, 91, size=len(df)), 90)
+            df["label_ts"] = df["event_ts"] + pd.to_timedelta(delay, unit="D")
+            matured = (df["label_ts"] <= now).values
+            df["label_status"] = np.select(
+                [matured, (~matured) & (df["label"].values == 1)],
+                ["matured", "confirmed"],
+                default="suspected",
+            )
+            df["created_ts"] = start_ts
+
+            rows = df[["transaction_id", "customer_id", "event_ts", "label",
+                       "label_ts", "label_status", "created_ts"]].to_dict("records")
+            with engine.begin() as conn:
+                for i in range(0, len(rows), 5000):
+                    conn.execute(text(f"""
+                        INSERT INTO {SCHEMA}.ml_fraud_label
+                            (transaction_id, customer_id, event_ts, label,
+                             label_ts, label_status, created_ts)
+                        VALUES (:transaction_id, :customer_id, :event_ts, :label,
+                                :label_ts, :label_status, :created_ts)
+                        ON CONFLICT (transaction_id) DO NOTHING
+                    """), rows[i: i + 5000])
+
+            total += len(df)
+            fraud_total += int(df["label"].sum())
+
+        log_run(pipeline, start_ts, datetime.utcnow(), "success", total, total, cfg=cfg)
+        logger.info(f"[{pipeline}] Done. {total:,} label rows ({fraud_total:,} fraud).")
 
         push_metrics(pipeline, {
-            "fraud_ml_label_rows_total":  len(df),
-            "fraud_ml_label_fraud_count": int(df["label"].sum()),
-            "fraud_ml_label_fraud_rate":  round(df["label"].mean(), 4),
+            "fraud_ml_label_rows_total":  total,
+            "fraud_ml_label_fraud_count": fraud_total,
+            "fraud_ml_label_fraud_rate":  round(fraud_total / total, 4) if total else 0,
         })
 
     except Exception as e:
@@ -198,7 +233,7 @@ def run_ml_training(cfg: dict | None = None) -> None:
             SELECT
                 l.transaction_id,
                 l.customer_id,
-                l.event_timestamp,
+                l.event_ts,
                 l.label,
                 f.f_customer_total_txn_90d,
                 f.f_customer_avg_txn_amount_90d,
@@ -206,10 +241,10 @@ def run_ml_training(cfg: dict | None = None) -> None:
                 f.f_customer_decline_rate_90d,
                 f.f_customer_foreign_txn_ratio_90d,
                 f.f_customer_night_txn_ratio_90d,
-                f.event_timestamp                                       AS feature_snapshot_ts,
-                t.amount                                                AS txn_amount,
-                EXTRACT(HOUR FROM l.event_timestamp)::SMALLINT          AS txn_hour,
-                COALESCE(t.is_declined, 0)                              AS is_declined_txn,
+                f.event_ts                                       AS feature_snapshot_ts,
+                t.amount_base                                           AS txn_amount,
+                EXTRACT(HOUR FROM l.event_ts)::SMALLINT          AS txn_hour,
+                CASE WHEN ds.status_name = 'declined' THEN 1 ELSE 0 END AS is_declined_txn,
                 CASE WHEN t.ip_country IS NOT NULL
                           AND dc.card_country IS NOT NULL
                           AND LOWER(t.ip_country) != LOWER(dc.card_country)
@@ -219,16 +254,18 @@ def run_ml_training(cfg: dict | None = None) -> None:
                 SELECT *
                 FROM {SCHEMA}.feat_customer_90d u
                 WHERE u.customer_id = l.customer_id
-                  AND u.event_timestamp <= l.event_timestamp
-                ORDER BY u.event_timestamp DESC
+                  AND u.event_ts <= l.event_ts
+                ORDER BY u.event_ts DESC
                 LIMIT 1
             ) f ON TRUE
             LEFT JOIN {SCHEMA}.fact_transaction t
                 ON t.transaction_id = l.transaction_id
             LEFT JOIN {SCHEMA}.dim_card dc
                 ON dc.card_key = t.card_key
+            LEFT JOIN {SCHEMA}.dim_transaction_status ds
+                ON ds.status_key = t.status_key
         """, engine)
-        df["event_timestamp"] = pd.to_datetime(df["event_timestamp"])
+        df["event_ts"] = pd.to_datetime(df["event_ts"])
         logger.info(f"[{pipeline}] PIT join complete — {len(df):,} rows.")
 
         # ── Step 2: per-transaction streaming features from Delta Lake ─────────
@@ -236,7 +273,7 @@ def run_ml_training(cfg: dict | None = None) -> None:
         # Each transaction's 30m/1h window only ever spans 2 calendar days.
         logger.info(f"[{pipeline}] Computing per-txn streaming features date-by-date...")
         silver_events = f"{silver_base}/stg_fraud_events"
-        df["_txn_date"] = df["event_timestamp"].dt.date
+        df["_txn_date"] = df["event_ts"].dt.date
         txn_dates = sorted(df["_txn_date"].unique())
         all_stream_feats = []
 
@@ -251,7 +288,7 @@ def run_ml_training(cfg: dict | None = None) -> None:
                                    partitions=[("event_date", "=", d)])
                 if not chunk.empty:
                     parts.append(
-                        chunk[["customer_id", "event_type", "event_timestamp", "merchant_id"]]
+                        chunk[["customer_id", "event_type", "event_ts", "merchant_id"]]
                     )
 
             if not parts:
@@ -264,7 +301,7 @@ def run_ml_training(cfg: dict | None = None) -> None:
                 continue
 
             ev_slice = pd.concat(parts, ignore_index=True)
-            ev_slice["event_timestamp"] = pd.to_datetime(ev_slice["event_timestamp"])
+            ev_slice["event_ts"] = pd.to_datetime(ev_slice["event_ts"])
             feats = _compute_per_txn_streaming_features(txn_slice, ev_slice)
             all_stream_feats.append(feats)
 
@@ -281,7 +318,7 @@ def run_ml_training(cfg: dict | None = None) -> None:
 
         # ── Step 3: write to ml_fraud_training ────────────────────────────────
         insert_cols = [
-            "transaction_id", "customer_id", "event_timestamp", "label",
+            "transaction_id", "customer_id", "event_ts", "label",
             "f_customer_total_txn_90d", "f_customer_avg_txn_amount_90d",
             "f_customer_distinct_merchants_90d", "f_customer_decline_rate_90d",
             "f_customer_foreign_txn_ratio_90d", "f_customer_night_txn_ratio_90d",

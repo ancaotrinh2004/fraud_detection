@@ -1,0 +1,19 @@
+# Strimzi KafkaTopic CRs — managed declaratively by Strimzi Topic Operator
+# Apply after Kafka cluster is Running:
+#   kubectl apply -f infra/k8s/kafka/kafka-topics.yaml
+
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: fraud-events-raw
+  namespace: fraud-infra
+  labels:
+    strimzi.io/cluster: fraud-kafka
+spec:
+  topicName: fraud.events.raw
+  partitions: 3
+  replicas: 1
+  config:
+    retention.ms: "86400000"      # 24h
+    segment.bytes: "536870912"    # 512MB

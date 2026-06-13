@@ -48,7 +48,7 @@ def _coerce_object_nulls(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _cast_types(df: pd.DataFrame) -> pd.DataFrame:
-    df["transaction_timestamp"] = pd.to_datetime(df["transaction_timestamp"], errors="coerce")
+    df["transaction_ts"] = pd.to_datetime(df["transaction_ts"], errors="coerce")
     df["created_ts"]            = pd.to_datetime(df["created_ts"],            errors="coerce")
     df["amount"]                = pd.to_numeric(df["amount"], errors="coerce")
     df["is_fraud"]              = df["is_fraud"].astype("Int8")
@@ -57,7 +57,7 @@ def _cast_types(df: pd.DataFrame) -> pd.DataFrame:
 
 def _reject_bad_rows(df: pd.DataFrame, dead_letter_base: str, start_ts: datetime):
     required_notnull = ["transaction_id", "customer_id", "card_id",
-                        "merchant_id", "amount", "transaction_timestamp"]
+                        "merchant_id", "amount", "transaction_ts"]
     mask_bad = df[required_notnull].isna().any(axis=1)
     mask_bad |= ~df["transaction_status"].isin(VALID_STATUSES)
     mask_bad |= df["amount"] <= 0
@@ -245,7 +245,7 @@ def run(cfg: dict | None = None) -> None:
             df["ip_country"] = df["ip_country"].str.strip().str.upper()
 
             df["stg_processed_ts"] = datetime.utcnow()
-            df["transaction_date"] = df["transaction_timestamp"].dt.date.astype(str)
+            df["transaction_date"] = df["transaction_ts"].dt.date.astype(str)
 
             qr = QualityResult(pipeline=PIPELINE_NAME)
             check_not_empty(df, qr)

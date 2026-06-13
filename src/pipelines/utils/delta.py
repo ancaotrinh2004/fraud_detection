@@ -155,7 +155,7 @@ def get_last_ingest_ts(table_path: str, storage_options: Optional[dict] = None,
 
 def get_last_created_watermark(table_path: str, storage_options: Optional[dict] = None):
     """Return max(created_ts) from a Bronze table — used as the late-event watermark.
-    Tracking created_ts instead of event_timestamp allows late-arriving events
-    (old event_timestamp, recent created_ts) to pass through on subsequent runs.
+    Tracking created_ts instead of event_ts allows late-arriving events
+    (old event_ts, recent created_ts) to pass through on subsequent runs.
     """
     return get_last_ingest_ts(table_path, storage_options=storage_options, ts_col="created_ts")

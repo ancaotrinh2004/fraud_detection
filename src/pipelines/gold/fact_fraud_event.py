@@ -27,7 +27,7 @@ LATE_ARRIVAL_DAYS = 2
 
 _FACT_COLS = [
     "event_id", "customer_key", "event_date_key", "event_type",
-    "event_timestamp", "created_ts", "session_id", "device_type",
+    "event_ts", "created_ts", "session_id", "device_type",
     "ip_country", "card_key", "merchant_key", "amount", "failure_reason",
     "is_otp_failed", "is_declined", "is_transaction_attempt",
 ]
@@ -35,15 +35,15 @@ _FACT_COLS = [
 _UPSERT_SQL = text(f"""
     INSERT INTO gold_fraud.fact_fraud_event
         (event_id, customer_key, event_date_key, event_type,
-         event_timestamp, created_ts, session_id, device_type,
+         event_ts, created_ts, session_id, device_type,
          ip_country, card_key, merchant_key, amount, failure_reason,
          is_otp_failed, is_declined, is_transaction_attempt)
     VALUES
         (:event_id, :customer_key, :event_date_key, :event_type,
-         :event_timestamp, :created_ts, :session_id, :device_type,
+         :event_ts, :created_ts, :session_id, :device_type,
          :ip_country, :card_key, :merchant_key, :amount, :failure_reason,
          :is_otp_failed, :is_declined, :is_transaction_attempt)
-    ON CONFLICT (event_id, event_timestamp) DO UPDATE SET
+    ON CONFLICT (event_id, event_ts) DO UPDATE SET
         customer_key           = EXCLUDED.customer_key,
         event_date_key         = EXCLUDED.event_date_key,
         is_otp_failed          = EXCLUDED.is_otp_failed,
@@ -164,7 +164,7 @@ def _resolve_keys(df: pd.DataFrame, dims: dict) -> pd.DataFrame:
     else:
         df["merchant_key"] = None
     df["event_date_key"] = (
-        pd.to_datetime(df["event_timestamp"]).dt.strftime("%Y%m%d").astype(int)
+        pd.to_datetime(df["event_ts"]).dt.strftime("%Y%m%d").astype(int)
     )
     before = len(df)
     df = df[df["event_date_key"].isin(dims["valid_date_keys"])].copy()
@@ -253,15 +253,15 @@ def run(cfg: dict | None = None) -> None:
 
             before_dedup = len(df)
             df = df.sort_values("created_ts", ascending=False).drop_duplicates(
-                subset=["event_id", "event_timestamp"], keep="first"
+                subset=["event_id", "event_ts"], keep="first"
             )
             if len(df) < before_dedup:
                 logger.warning(f"[{PIPELINE_NAME}] {date_val}: deduped {before_dedup - len(df):,} duplicate rows from silver.")
 
             qr = QualityResult(pipeline=PIPELINE_NAME)
             check_not_empty(df, qr)
-            check_unique(df, ["event_id", "event_timestamp"], qr)
-            check_no_nulls(df, ["event_id", "event_type", "event_timestamp"], qr)
+            check_unique(df, ["event_id", "event_ts"], qr)
+            check_no_nulls(df, ["event_id", "event_type", "event_ts"], qr)
             if not qr.passed:
                 raise ValueError(f"Quality checks failed for {date_val}:\n{qr.summary()}")
 

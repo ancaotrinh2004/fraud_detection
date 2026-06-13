@@ -1,37 +1,48 @@
 """
-API contract tests for src/inference/server.py.
+Contract tests for src/inference/server.py — the KServe FraudModel.
 
-All external dependencies (DB, MinIO, model loading) are mocked so these
-tests run in CI without a live cluster.  The FastAPI app is imported once
-at module level with lifespan patched; tests patch globals per-function.
+The server was migrated from a FastAPI app to a KServe custom-container model
+(open-inference-protocol V2). These tests drive FraudModel.predict() directly
+with V2 payloads; all external dependencies (DB, MLflow, OTel) are mocked.
+
+`kserve` is stubbed in sys.modules so the module imports without the (heavy)
+KServe runtime — the server only needs kserve.Model as a base class here.
 
 Coverage:
-  - Health endpoints (live, ready, ready-503)
-  - Model info endpoint
-  - Predict endpoint: request validation, response shape, fraud logic, batch
-  - Metrics endpoint (prometheus-fastapi-instrumentator)
-  - Server startup with no model loaded
+  - _extract_instances: V2 dict payload and InferRequest object
+  - predict: response shape, batch, fraud logic, derived features
+  - measure_latency decorator: passthrough + structured latency log
 """
 
+import json
+import sys
+import types
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
-from fastapi.testclient import TestClient
+
+
+# ── Stub kserve before importing the server ────────────────────────────────────
+
+if "kserve" not in sys.modules:
+    _kserve = types.ModuleType("kserve")
+
+    class _StubModel:
+        def __init__(self, name):
+            self.name = name
+            self.ready = False
+
+    _kserve.Model = _StubModel
+    _kserve.ModelServer = MagicMock()
+    sys.modules["kserve"] = _kserve
+
 
 from src.pipelines.ml.services import FEATURE_COLS, ModelArtifact
+from src.inference.server import FraudModel, measure_latency, MODEL_NAME, SCORE_THRESH
 
 
-# ── Module-level import (lifespan NOT triggered without `with` context) ────────
-
-# Patch startup hooks so app can be imported without DB/MinIO
-with patch("src.inference.server._load_model"), \
-     patch("src.inference.server._get_engine"):
-    from src.inference.server import app
-    import src.inference.server as srv
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _make_artifact(fraud_prob: float = 0.05, version: str = "v_contract_test"):
     model = MagicMock()
@@ -39,307 +50,248 @@ def _make_artifact(fraud_prob: float = 0.05, version: str = "v_contract_test"):
         np.full(len(X), 1 - fraud_prob),
         np.full(len(X), fraud_prob),
     ])
-    return ModelArtifact(
-        model=model,
-        feature_cols=FEATURE_COLS,
-        model_version=version,
-        metrics={"pr_auc": 0.85},
-    )
+    return ModelArtifact(model=model, feature_cols=FEATURE_COLS,
+                         model_version=version, metrics={"pr_auc": 0.85})
 
 
 def _zero_features():
     return {c: 0.0 for c in FEATURE_COLS}
 
 
-@pytest.fixture
-def artifact():
-    return _make_artifact()
+def _payload(instances: list) -> dict:
+    """Build a KServe V2 infer request with JSON-encoded instances."""
+    return {"inputs": [{
+        "name":     "instances",
+        "datatype": "BYTES",
+        "shape":    [len(instances)],
+        "data":     [json.dumps(i) for i in instances],
+    }]}
 
 
 @pytest.fixture
-def client(artifact):
-    with patch.object(srv, "_artifact", artifact), \
-         patch.object(srv, "_fetch_features", return_value=_zero_features()):
-        yield TestClient(app, raise_server_exceptions=True)
+def model():
+    m = FraudModel(MODEL_NAME)
+    m._artifact = _make_artifact()
+    m._engine   = MagicMock()
+    m.ready     = True
+    return m
 
 
-def _predict(client, customer_id="C0000001", amount=150.0, hour=14,
-             is_declined=0, is_foreign=0):
-    return client.post("/v1/models/fraud:predict", json={
-        "instances": [{
-            "customer_id":     customer_id,
-            "txn_amount":      amount,
-            "txn_hour":        hour,
-            "is_declined_txn": is_declined,
-            "is_foreign_txn":  is_foreign,
-        }]
-    })
+def _predict(model, instances):
+    with patch.object(model, "_fetch_features", return_value=_zero_features()):
+        resp = model.predict(_payload(instances))
+    preds = [json.loads(s) for s in resp["outputs"][0]["data"]]
+    return resp, preds
 
 
-# ── Health endpoints ───────────────────────────────────────────────────────────
+# ── _extract_instances ─────────────────────────────────────────────────────────
 
-class TestLivenessEndpoint:
-    def test_returns_200(self, client):
-        r = client.get("/v2/health/live")
-        assert r.status_code == 200
+class TestExtractInstances:
+    def test_dict_payload_returns_data_list(self):
+        data = FraudModel._extract_instances(_payload([{"a": 1}, {"a": 2}]))
+        assert len(data) == 2
 
-    def test_body_has_status_alive(self, client):
-        r = client.get("/v2/health/live")
-        assert r.json() == {"status": "alive"}
+    def test_missing_inputs_key_returns_empty(self):
+        assert FraudModel._extract_instances({}) == []
 
-    def test_available_before_model_loaded(self):
-        with patch.object(srv, "_artifact", None):
-            c = TestClient(app)
-            r = c.get("/v2/health/live")
-        assert r.status_code == 200
+    def test_empty_inputs_returns_empty(self):
+        assert FraudModel._extract_instances({"inputs": []}) == []
 
+    def test_infer_request_object_returns_data(self):
+        req = MagicMock()
+        req.inputs = [MagicMock(data=["a", "b", "c"])]
+        assert FraudModel._extract_instances(req) == ["a", "b", "c"]
 
-class TestReadinessEndpoint:
-    def test_returns_200_when_model_loaded(self, client):
-        r = client.get("/v2/health/ready")
-        assert r.status_code == 200
-
-    def test_body_has_status_ready(self, client):
-        r = client.get("/v2/health/ready")
-        assert r.json() == {"status": "ready"}
-
-    def test_returns_503_when_model_not_loaded(self):
-        with patch.object(srv, "_artifact", None):
-            c = TestClient(app, raise_server_exceptions=False)
-            r = c.get("/v2/health/ready")
-        assert r.status_code == 503
-
-    def test_503_body_has_detail(self):
-        with patch.object(srv, "_artifact", None):
-            c = TestClient(app, raise_server_exceptions=False)
-            r = c.get("/v2/health/ready")
-        assert "detail" in r.json()
+    def test_infer_request_with_no_inputs_returns_empty(self):
+        req = MagicMock()
+        req.inputs = []
+        assert FraudModel._extract_instances(req) == []
 
 
-# ── Model info endpoint ────────────────────────────────────────────────────────
-
-class TestModelInfoEndpoint:
-    def test_returns_200(self, client):
-        r = client.get("/v1/models/fraud")
-        assert r.status_code == 200
-
-    def test_body_has_required_fields(self, client):
-        body = client.get("/v1/models/fraud").json()
-        for field in ["name", "ready", "model_version", "metrics"]:
-            assert field in body
-
-    def test_name_is_fraud(self, client):
-        body = client.get("/v1/models/fraud").json()
-        assert body["name"] == "fraud"
-
-    def test_ready_is_true_when_loaded(self, client):
-        body = client.get("/v1/models/fraud").json()
-        assert body["ready"] is True
-
-    def test_model_version_matches_artifact(self, client, artifact):
-        body = client.get("/v1/models/fraud").json()
-        assert body["model_version"] == artifact.model_version
-
-    def test_returns_503_when_model_not_loaded(self):
-        with patch.object(srv, "_artifact", None):
-            c = TestClient(app, raise_server_exceptions=False)
-            r = c.get("/v1/models/fraud")
-        assert r.status_code == 503
-
-
-# ── Predict endpoint — request validation ─────────────────────────────────────
-
-class TestPredictRequestValidation:
-    def test_missing_customer_id_returns_422(self, client):
-        r = client.post("/v1/models/fraud:predict", json={
-            "instances": [{"txn_amount": 100.0, "txn_hour": 10}]
-        })
-        assert r.status_code == 422
-
-    def test_missing_txn_amount_returns_422(self, client):
-        r = client.post("/v1/models/fraud:predict", json={
-            "instances": [{"customer_id": "C1", "txn_hour": 10}]
-        })
-        assert r.status_code == 422
-
-    def test_missing_txn_hour_returns_422(self, client):
-        r = client.post("/v1/models/fraud:predict", json={
-            "instances": [{"customer_id": "C1", "txn_amount": 100.0}]
-        })
-        assert r.status_code == 422
-
-    def test_invalid_content_type_returns_422(self, client):
-        r = client.post(
-            "/v1/models/fraud:predict",
-            content="not-json",
-            headers={"Content-Type": "application/json"},
-        )
-        assert r.status_code == 422
-
-    def test_empty_instances_list_returns_200(self, client):
-        r = client.post("/v1/models/fraud:predict", json={"instances": []})
-        assert r.status_code == 200
-        assert r.json()["predictions"] == []
-
-    def test_optional_fields_default_to_zero(self, client):
-        r = client.post("/v1/models/fraud:predict", json={
-            "instances": [{"customer_id": "C1", "txn_amount": 100.0, "txn_hour": 10}]
-        })
-        assert r.status_code == 200
-
-    def test_model_not_loaded_returns_503(self):
-        with patch.object(srv, "_artifact", None), \
-             patch.object(srv, "_fetch_features", return_value=_zero_features()):
-            c = TestClient(app, raise_server_exceptions=False)
-            r = c.post("/v1/models/fraud:predict", json={
-                "instances": [{"customer_id": "C1", "txn_amount": 100.0, "txn_hour": 10}]
-            })
-        assert r.status_code == 503
-
-
-# ── Predict endpoint — response shape ─────────────────────────────────────────
+# ── predict — response shape ───────────────────────────────────────────────────
 
 class TestPredictResponseShape:
-    def test_returns_200(self, client):
-        assert _predict(client).status_code == 200
+    def test_model_name_in_response(self, model):
+        resp, _ = _predict(model, [{"customer_id": "C1", "txn_amount": 100.0, "txn_hour": 10}])
+        assert resp["model_name"] == MODEL_NAME
 
-    def test_has_predictions_key(self, client):
-        assert "predictions" in _predict(client).json()
+    def test_has_request_id(self, model):
+        resp, _ = _predict(model, [{"customer_id": "C1", "txn_amount": 100.0, "txn_hour": 10}])
+        assert resp["id"]
 
-    def test_predictions_is_list(self, client):
-        assert isinstance(_predict(client).json()["predictions"], list)
+    def test_empty_instances_returns_empty_outputs(self, model):
+        resp = model.predict(_payload([]))
+        assert resp == {"outputs": []}
 
-    def test_one_prediction_per_instance(self, client):
-        r = client.post("/v1/models/fraud:predict", json={
-            "instances": [
-                {"customer_id": "C1", "txn_amount": 100.0, "txn_hour": 10},
-                {"customer_id": "C2", "txn_amount": 200.0, "txn_hour": 3},
-                {"customer_id": "C3", "txn_amount": 50.0,  "txn_hour": 20},
-            ]
-        })
-        assert len(r.json()["predictions"]) == 3
+    def test_one_prediction_per_instance(self, model):
+        _, preds = _predict(model, [
+            {"customer_id": "C1", "txn_amount": 100.0, "txn_hour": 10},
+            {"customer_id": "C2", "txn_amount": 200.0, "txn_hour": 3},
+            {"customer_id": "C3", "txn_amount": 50.0,  "txn_hour": 20},
+        ])
+        assert len(preds) == 3
 
-    def test_prediction_has_customer_id(self, client):
-        pred = _predict(client, customer_id="C_TEST").json()["predictions"][0]
-        assert pred["customer_id"] == "C_TEST"
+    def test_output_datatype_is_bytes(self, model):
+        resp, _ = _predict(model, [{"customer_id": "C1", "txn_amount": 100.0, "txn_hour": 10}])
+        assert resp["outputs"][0]["datatype"] == "BYTES"
 
-    def test_prediction_has_fraud_score(self, client):
-        pred = _predict(client).json()["predictions"][0]
-        assert "fraud_score" in pred
+    def test_output_shape_matches_count(self, model):
+        resp, _ = _predict(model, [
+            {"customer_id": "C1", "txn_amount": 100.0, "txn_hour": 10},
+            {"customer_id": "C2", "txn_amount": 100.0, "txn_hour": 10},
+        ])
+        assert resp["outputs"][0]["shape"] == [2]
 
-    def test_prediction_has_is_fraud(self, client):
-        pred = _predict(client).json()["predictions"][0]
-        assert "is_fraud" in pred
+    def test_prediction_has_required_fields(self, model):
+        _, preds = _predict(model, [{"customer_id": "C1", "txn_amount": 100.0, "txn_hour": 10}])
+        for field in ("customer_id", "fraud_score", "is_fraud"):
+            assert field in preds[0]
 
-    def test_fraud_score_is_numeric(self, client):
-        pred = _predict(client).json()["predictions"][0]
-        assert isinstance(pred["fraud_score"], (int, float))
+    def test_fraud_score_is_numeric_in_range(self, model):
+        _, preds = _predict(model, [{"customer_id": "C1", "txn_amount": 100.0, "txn_hour": 10}])
+        assert isinstance(preds[0]["fraud_score"], (int, float))
+        assert 0.0 <= preds[0]["fraud_score"] <= 1.0
 
-    def test_fraud_score_between_0_and_1(self, client):
-        pred = _predict(client).json()["predictions"][0]
-        assert 0.0 <= pred["fraud_score"] <= 1.0
+    def test_is_fraud_is_bool(self, model):
+        _, preds = _predict(model, [{"customer_id": "C1", "txn_amount": 100.0, "txn_hour": 10}])
+        assert isinstance(preds[0]["is_fraud"], bool)
 
-    def test_is_fraud_is_bool(self, client):
-        pred = _predict(client).json()["predictions"][0]
-        assert isinstance(pred["is_fraud"], bool)
+    def test_customer_id_echoed(self, model):
+        _, preds = _predict(model, [{"customer_id": "UNIQUE_XYZ", "txn_amount": 100.0, "txn_hour": 10}])
+        assert preds[0]["customer_id"] == "UNIQUE_XYZ"
 
-    def test_customer_id_echoed_back(self, client):
-        pred = _predict(client, customer_id="UNIQUE_ID_XYZ").json()["predictions"][0]
-        assert pred["customer_id"] == "UNIQUE_ID_XYZ"
+    def test_optional_fields_default_to_zero(self, model):
+        # is_declined_txn / is_foreign_txn omitted → must still score
+        _, preds = _predict(model, [{"customer_id": "C1", "txn_amount": 100.0, "txn_hour": 10}])
+        assert preds[0]["customer_id"] == "C1"
+
+    def test_missing_required_field_raises(self, model):
+        with patch.object(model, "_fetch_features", return_value=_zero_features()):
+            with pytest.raises((KeyError, ValueError, TypeError)):
+                model.predict(_payload([{"customer_id": "C1", "txn_amount": 100.0}]))  # no txn_hour
 
 
-# ── Predict endpoint — fraud logic ────────────────────────────────────────────
+# ── predict — fraud logic ──────────────────────────────────────────────────────
 
 class TestPredictFraudLogic:
-    def test_high_fraud_prob_sets_is_fraud_true(self):
-        art = _make_artifact(fraud_prob=0.95)
-        with patch.object(srv, "_artifact", art), \
-             patch.object(srv, "_fetch_features", return_value=_zero_features()):
-            c = TestClient(app)
-            pred = c.post("/v1/models/fraud:predict", json={
-                "instances": [{"customer_id": "C1", "txn_amount": 5000.0, "txn_hour": 3}]
-            }).json()["predictions"][0]
-        assert pred["is_fraud"] is True
-        assert pred["fraud_score"] >= 0.5
+    def test_high_prob_is_fraud_true(self):
+        m = FraudModel(MODEL_NAME)
+        m._artifact = _make_artifact(fraud_prob=0.95)
+        _, preds = _predict(m, [{"customer_id": "C1", "txn_amount": 5000.0, "txn_hour": 3}])
+        assert preds[0]["is_fraud"] is True
+        assert preds[0]["fraud_score"] >= SCORE_THRESH
 
-    def test_low_fraud_prob_sets_is_fraud_false(self):
-        art = _make_artifact(fraud_prob=0.02)
-        with patch.object(srv, "_artifact", art), \
-             patch.object(srv, "_fetch_features", return_value=_zero_features()):
-            c = TestClient(app)
-            pred = c.post("/v1/models/fraud:predict", json={
-                "instances": [{"customer_id": "C1", "txn_amount": 100.0, "txn_hour": 14}]
-            }).json()["predictions"][0]
-        assert pred["is_fraud"] is False
-        assert pred["fraud_score"] < 0.5
+    def test_low_prob_is_fraud_false(self):
+        m = FraudModel(MODEL_NAME)
+        m._artifact = _make_artifact(fraud_prob=0.02)
+        _, preds = _predict(m, [{"customer_id": "C1", "txn_amount": 100.0, "txn_hour": 14}])
+        assert preds[0]["is_fraud"] is False
+        assert preds[0]["fraud_score"] < SCORE_THRESH
 
-    def test_score_threshold_is_0_5(self):
-        art = _make_artifact(fraud_prob=0.5)  # exactly at boundary → is_fraud True (>=)
-        with patch.object(srv, "_artifact", art), \
-             patch.object(srv, "_fetch_features", return_value=_zero_features()):
-            c = TestClient(app)
-            pred = c.post("/v1/models/fraud:predict", json={
-                "instances": [{"customer_id": "C1", "txn_amount": 100.0, "txn_hour": 10}]
-            }).json()["predictions"][0]
-        assert pred["is_fraud"] is True  # score 0.5 >= 0.5 → fraud
-
-    def test_derived_features_computed_from_txn_input(self, client, artifact):
-        """Verify that txn_amount_ratio and is_night_txn are computed from request fields."""
-        # We pass avg feature = 100, txn_amount = 300 → ratio should be ~3.0
-        # We pass txn_hour = 2 → is_night_txn = 1
-        features = _zero_features()
-        features["f_customer_avg_txn_amount_90d"] = 100.0
-        with patch.object(srv, "_artifact", artifact), \
-             patch.object(srv, "_fetch_features", return_value=features):
-            c = TestClient(app)
-            r = c.post("/v1/models/fraud:predict", json={
-                "instances": [{"customer_id": "C1", "txn_amount": 300.0, "txn_hour": 2}]
-            })
-        assert r.status_code == 200
-        # Just verify derived features don't break the pipeline
-        pred = r.json()["predictions"][0]
-        assert "fraud_score" in pred
+    def test_threshold_boundary_is_fraud(self):
+        m = FraudModel(MODEL_NAME)
+        m._artifact = _make_artifact(fraud_prob=SCORE_THRESH)  # exactly 0.5 → >= → fraud
+        _, preds = _predict(m, [{"customer_id": "C1", "txn_amount": 100.0, "txn_hour": 10}])
+        assert preds[0]["is_fraud"] is True
 
 
-# ── Batch predict ──────────────────────────────────────────────────────────────
+# ── predict — derived features ─────────────────────────────────────────────────
+
+class TestDerivedFeatures:
+    def test_txn_amount_ratio_and_night_flag_passed_to_scoring(self, model):
+        feats = _zero_features()
+        feats["f_customer_avg_txn_amount_90d"] = 100.0
+        captured = {}
+
+        def fake_score(artifact, features):
+            captured.update(features)
+            return {"fraud_score": 0.1, "model_version": "v"}
+
+        with patch.object(model, "_fetch_features", return_value=feats), \
+             patch.object(model._scoring, "score_online", side_effect=fake_score):
+            model.predict(_payload([{"customer_id": "C1", "txn_amount": 300.0, "txn_hour": 2}]))
+
+        assert captured["txn_amount_ratio"] == pytest.approx(3.0)  # 300 / 100
+        assert captured["is_night_txn"] == 1                       # hour 2 ∈ [1,4]
+
+    def test_ratio_zero_when_no_history(self, model):
+        captured = {}
+
+        def fake_score(artifact, features):
+            captured.update(features)
+            return {"fraud_score": 0.1, "model_version": "v"}
+
+        with patch.object(model, "_fetch_features", return_value=_zero_features()), \
+             patch.object(model._scoring, "score_online", side_effect=fake_score):
+            model.predict(_payload([{"customer_id": "C1", "txn_amount": 300.0, "txn_hour": 14}]))
+
+        assert captured["txn_amount_ratio"] == 0     # avg 0 → ratio 0
+        assert captured["is_night_txn"] == 0
+
+
+# ── batch ──────────────────────────────────────────────────────────────────────
 
 class TestBatchPredict:
-    def test_batch_of_10_returns_10_predictions(self, client):
-        r = client.post("/v1/models/fraud:predict", json={
-            "instances": [
-                {"customer_id": f"C{i:07d}", "txn_amount": float(i * 10), "txn_hour": i % 24}
-                for i in range(10)
-            ]
-        })
-        assert r.status_code == 200
-        assert len(r.json()["predictions"]) == 10
+    def test_batch_of_10(self, model):
+        _, preds = _predict(model, [
+            {"customer_id": f"C{i:07d}", "txn_amount": float(i * 10), "txn_hour": i % 24}
+            for i in range(10)
+        ])
+        assert len(preds) == 10
 
-    def test_batch_customer_ids_match_input_order(self, client):
-        customer_ids = [f"C_{i:05d}" for i in range(5)]
-        r = client.post("/v1/models/fraud:predict", json={
-            "instances": [
-                {"customer_id": cid, "txn_amount": 100.0, "txn_hour": 10}
-                for cid in customer_ids
-            ]
-        })
-        returned_ids = [p["customer_id"] for p in r.json()["predictions"]]
-        assert returned_ids == customer_ids
+    def test_customer_ids_preserve_order(self, model):
+        ids = [f"C_{i:05d}" for i in range(5)]
+        _, preds = _predict(model, [
+            {"customer_id": cid, "txn_amount": 100.0, "txn_hour": 10} for cid in ids
+        ])
+        assert [p["customer_id"] for p in preds] == ids
 
 
-# ── Metrics endpoint ───────────────────────────────────────────────────────────
+# ── measure_latency decorator ──────────────────────────────────────────────────
 
-class TestMetricsEndpoint:
-    def test_metrics_endpoint_returns_200(self, client):
-        assert client.get("/metrics").status_code == 200
+class TestMeasureLatency:
+    def test_returns_result_unchanged(self):
+        @measure_latency
+        def handler(self):
+            return {"id": "abc", "outputs": [{"shape": [3]}]}
 
-    def test_metrics_content_type_is_text_plain(self, client):
-        assert "text/plain" in client.get("/metrics").headers["content-type"]
+        result = handler(object())
+        assert result == {"id": "abc", "outputs": [{"shape": [3]}]}
 
-    def test_metrics_contains_http_requests_total(self, client):
-        # Make a request first to populate counter
-        _predict(client)
-        assert "http_requests_total" in client.get("/metrics").text
+    def test_logs_func_name_and_latency(self):
+        with patch("src.inference.server.logger") as mock_logger:
+            @measure_latency
+            def handler(self):
+                return {"id": "r1", "outputs": [{"shape": [2]}]}
 
-    def test_metrics_contains_http_request_duration(self, client):
-        _predict(client)
-        assert "http_request_duration" in client.get("/metrics").text
+            handler(object())
+
+        mock_logger.info.assert_called_once()
+        args, kwargs = mock_logger.info.call_args
+        assert args[0] == "handler"
+        assert "latency_ms" in kwargs["extra"]
+
+    def test_derives_request_id_and_n_instances_from_response(self):
+        with patch("src.inference.server.logger") as mock_logger:
+            @measure_latency
+            def handler(self):
+                return {"id": "req-9", "outputs": [{"shape": [4]}]}
+
+            handler(object())
+
+        extra = mock_logger.info.call_args[1]["extra"]
+        assert extra["request_id"] == "req-9"
+        assert extra["n_instances"] == 4
+
+    def test_tolerates_response_without_id_or_outputs(self):
+        with patch("src.inference.server.logger") as mock_logger:
+            @measure_latency
+            def handler(self):
+                return {"outputs": []}
+
+            handler(object())
+
+        extra = mock_logger.info.call_args[1]["extra"]
+        assert "latency_ms" in extra
+        assert "request_id" not in extra
+        assert "n_instances" not in extra

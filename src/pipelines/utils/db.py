@@ -11,7 +11,7 @@ from psycopg2.extras import execute_values
 from sqlalchemy import create_engine, text
 
 
-_CONFIG_PATH = Path(__file__).parents[3] / "config" / "pipeline_config.yaml"
+_CONFIG_PATH = Path(__file__).parents[3] / "configs" / "pipeline_config.yaml"
 
 
 def load_pipeline_config() -> dict:

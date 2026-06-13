@@ -27,8 +27,8 @@ def run_retrain_trigger(cfg: dict | None = None) -> None:
     engine   = get_sqlalchemy_engine(cfg)
     start_ts = datetime.now()
 
-    registry_svc = ModelRegistryService(engine)
-    monitor_svc  = MonitoringService(engine)
+    registry_svc = ModelRegistryService(cfg)
+    monitor_svc  = MonitoringService(engine, cfg)
     model_svc    = ModelService(cfg)
 
     logger.info(f"[{PIPELINE}] Checking retrain triggers...")

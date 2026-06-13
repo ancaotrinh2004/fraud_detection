@@ -104,6 +104,10 @@ def run(cfg: dict | None = None, execution_date: str | None = None) -> None:
             pd.to_datetime(df["transaction_timestamp"]).dt.date.astype(str)
         )
 
+        # Normalise external field name → internal lakehouse convention.
+        # Raw transactions carry "transaction_timestamp"; Bronze onward uses "transaction_ts".
+        df = df.rename(columns={"transaction_timestamp": "transaction_ts"})
+
         write_bronze(df, table_path, storage_options=storage_opts,
                      partition_by=["transaction_date"])
 

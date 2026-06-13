@@ -28,33 +28,34 @@ LATE_ARRIVAL_DAYS = 2
 
 _FACT_COLS = [
     "transaction_id", "customer_key", "card_key", "merchant_key",
-    "transaction_date_key", "status_key", "transaction_timestamp", "created_ts",
-    "amount", "currency", "city", "device_fingerprint", "ip_country",
-    "is_fraud", "is_approved", "is_declined",
+    "transaction_date_key", "status_key", "transaction_ts", "created_ts",
+    "amount", "currency", "amount_base", "fx_rate", "fx_rate_ts",
+    "city", "device_fingerprint", "ip_country",
 ]
 
 _UPSERT_SQL = text(f"""
     INSERT INTO gold_fraud.fact_transaction
         (transaction_id, customer_key, card_key, merchant_key,
-         transaction_date_key, status_key, transaction_timestamp, created_ts,
-         amount, currency, city, device_fingerprint, ip_country,
-         is_fraud, is_approved, is_declined)
+         transaction_date_key, status_key, transaction_ts, created_ts,
+         amount, currency, amount_base, fx_rate, fx_rate_ts,
+         city, device_fingerprint, ip_country)
     VALUES
         (:transaction_id, :customer_key, :card_key, :merchant_key,
-         :transaction_date_key, :status_key, :transaction_timestamp, :created_ts,
-         :amount, :currency, :city, :device_fingerprint, :ip_country,
-         :is_fraud, :is_approved, :is_declined)
+         :transaction_date_key, :status_key, :transaction_ts, :created_ts,
+         :amount, :currency, :amount_base, :fx_rate, :fx_rate_ts,
+         :city, :device_fingerprint, :ip_country)
     ON CONFLICT (transaction_id, transaction_date_key) DO UPDATE SET
         customer_key       = EXCLUDED.customer_key,
         card_key           = EXCLUDED.card_key,
         merchant_key       = EXCLUDED.merchant_key,
         status_key         = EXCLUDED.status_key,
         amount             = EXCLUDED.amount,
+        currency           = EXCLUDED.currency,
+        amount_base        = EXCLUDED.amount_base,
+        fx_rate            = EXCLUDED.fx_rate,
+        fx_rate_ts         = EXCLUDED.fx_rate_ts,
         device_fingerprint = EXCLUDED.device_fingerprint,
-        ip_country         = EXCLUDED.ip_country,
-        is_fraud           = EXCLUDED.is_fraud,
-        is_approved        = EXCLUDED.is_approved,
-        is_declined        = EXCLUDED.is_declined
+        ip_country         = EXCLUDED.ip_country
 """)
 
 
@@ -173,7 +174,7 @@ def _resolve_keys(df: pd.DataFrame, dims: dict, dead_letter: str) -> pd.DataFram
                   on="transaction_status", how="left")
 
     df["transaction_date_key"] = (
-        pd.to_datetime(df["transaction_timestamp"]).dt.strftime("%Y%m%d").astype(int)
+        pd.to_datetime(df["transaction_ts"]).dt.strftime("%Y%m%d").astype(int)
     )
 
     before = len(df)
@@ -188,9 +189,27 @@ def _resolve_keys(df: pd.DataFrame, dims: dict, dead_letter: str) -> pd.DataFram
     return df
 
 
-def _derive_flags(df: pd.DataFrame) -> pd.DataFrame:
-    df["is_approved"] = (df["transaction_status"] == "approved").astype("Int8")
-    df["is_declined"] = (df["transaction_status"] == "declined").astype("Int8")
+def _load_currency_rates(engine) -> pd.DataFrame:
+    """Load FX reference (currency → rate_to_base) from dim_currency_rate."""
+    return pd.read_sql(
+        f"SELECT currency, rate_to_base, rate_ts FROM {SCHEMA}.dim_currency_rate",
+        engine,
+    )
+
+
+def _apply_currency(df: pd.DataFrame, rates: pd.DataFrame) -> pd.DataFrame:
+    """Normalise amount → amount_base (base currency) via dim_currency_rate.
+
+    amount_base = amount * fx_rate. Unknown currency falls back to fx_rate=1
+    (treated as already in base) so a missing rate never nulls the fact.
+    """
+    df = df.merge(
+        rates.rename(columns={"rate_to_base": "fx_rate", "rate_ts": "fx_rate_ts"}),
+        on="currency", how="left",
+    )
+    df["fx_rate"]     = pd.to_numeric(df["fx_rate"], errors="coerce").fillna(1.0)
+    df["fx_rate_ts"]  = df["fx_rate_ts"].fillna(datetime.utcnow())
+    df["amount_base"] = (pd.to_numeric(df["amount"], errors="coerce") * df["fx_rate"]).round(2)
     return df
 
 
@@ -246,6 +265,7 @@ def run(cfg: dict | None = None) -> None:
 
         # Load dims early so we can pre-filter silver partition dates not covered by dim_date
         dims = _load_dim_keys(engine)
+        currency_rates = _load_currency_rates(engine)
         valid_date_strs = {
             f"{str(k)[0:4]}-{str(k)[4:6]}-{str(k)[6:]}"
             for k in dims["valid_date_keys"]
@@ -277,7 +297,7 @@ def run(cfg: dict | None = None) -> None:
 
             total_input += len(df)
             df = _resolve_keys(df, dims, dead_letter)
-            df = _derive_flags(df)
+            df = _apply_currency(df, currency_rates)
 
             if df.empty:
                 logger.warning(f"[{PIPELINE_NAME}] {date_val}: all rows dropped after key resolution, skipping.")
@@ -294,7 +314,7 @@ def run(cfg: dict | None = None) -> None:
             check_not_empty(df, qr)
             check_unique(df, ["transaction_id"], qr)
             check_no_nulls(df, ["transaction_id", "customer_key", "amount",
-                                 "transaction_timestamp"], qr)
+                                 "transaction_ts"], qr)
             if not qr.passed:
                 raise ValueError(f"Quality checks failed for {date_val}:\n{qr.summary()}")
             logger.info(qr.summary())

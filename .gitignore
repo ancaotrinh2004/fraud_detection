@@ -35,7 +35,7 @@ wheels/
 venv/
 ENV/
 env/
-
+.venv
 # IDE
 .vscode/
 .idea/
@@ -43,6 +43,10 @@ env/
 *.swo
 *~
 .env
+# Great Expectations project (suites/checkpoints/Data Docs generated at runtime)
+gx_project/
+gx/
+
 # OS
 .DS_Store
 Thumbs.db

@@ -2,10 +2,8 @@
 Shared pytest fixtures used across unit and integration tests.
 """
 
-import io
-import pickle
 from datetime import datetime, timedelta
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
 import pandas as pd
@@ -14,7 +12,6 @@ import pytest
 from src.pipelines.ml.services import (
     FEATURE_COLS,
     ModelArtifact,
-    ScoringService,
 )
 
 
@@ -60,15 +57,6 @@ def mock_engine():
     return engine
 
 
-# ── boto3 / S3 mock ────────────────────────────────────────────────────────────
-
-@pytest.fixture
-def mock_s3():
-    s3 = MagicMock()
-    s3.list_buckets.return_value = {"Buckets": [{"Name": "models"}]}
-    return s3
-
-
 # ── DataFrame fixtures ─────────────────────────────────────────────────────────
 
 def _make_training_df(n: int = 200, seed: int = 42) -> pd.DataFrame:
@@ -81,7 +69,7 @@ def _make_training_df(n: int = 200, seed: int = 42) -> pd.DataFrame:
         rows.append({
             "transaction_id":                    f"T{i:06d}",
             "customer_id":                       f"C{i % 30:07d}",
-            "event_timestamp":                   base_ts + timedelta(hours=i * 2),
+            "event_ts":                          base_ts + timedelta(hours=i * 2),
             "label":                             int(rng.integers(0, 2)),
             "f_customer_total_txn_90d":          float(rng.integers(1, 100)),
             "f_customer_avg_txn_amount_90d":     avg,
@@ -100,7 +88,7 @@ def _make_training_df(n: int = 200, seed: int = 42) -> pd.DataFrame:
             "is_foreign_txn":                    int(rng.integers(0, 2)),
         })
     df = pd.DataFrame(rows)
-    df["event_timestamp"] = pd.to_datetime(df["event_timestamp"])
+    df["event_ts"] = pd.to_datetime(df["event_ts"])
     return df
 
 
@@ -210,35 +198,3 @@ def night_fraud_features():
         "txn_amount_ratio":               25.0,
         "is_night_txn":                        1,
     }
-
-
-# ── Picklable model & artifact (for save/load tests) ──────────────────────────
-
-class _PicklableModel:
-    """Minimal real model that is picklable (unlike MagicMock)."""
-    def predict_proba(self, X):
-        n = len(X)
-        return np.column_stack([np.full(n, 0.9), np.full(n, 0.1)])
-
-
-@pytest.fixture
-def picklable_artifact():
-    return ModelArtifact(
-        model=_PicklableModel(),
-        feature_cols=FEATURE_COLS,
-        model_version="v_picklable_test",
-        metrics={"pr_auc": 0.75, "f1": 0.60},
-    )
-
-
-def make_pickled_artifact(artifact: ModelArtifact) -> bytes:
-    """Serialise a ModelArtifact the same way ModelService.save_model does.
-    The artifact's model must be picklable — use picklable_artifact fixture."""
-    payload = {
-        "model":        artifact.model,
-        "feature_cols": artifact.feature_cols,
-        "metrics":      artifact.metrics,
-    }
-    buf = io.BytesIO()
-    pickle.dump(payload, buf)
-    return buf.getvalue()

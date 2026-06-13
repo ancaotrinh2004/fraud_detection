@@ -1,14 +1,18 @@
 """
-Unit tests for ModelService — boto3/MinIO fully mocked.
-Coverage: __init__, _ensure_bucket, train, evaluate, save_model, load_model.
+Unit tests for ModelService — MLflow fully mocked.
+
+ModelService was migrated from boto3/MinIO pickle persistence to MLflow:
+  - save_model() logs via mlflow.sklearn.log_model() and resolves the logged
+    model's physical artifact location for the registry.
+  - load_model() loads via mlflow.sklearn.load_model() from a models:/ or runs:/ URI.
+
+Coverage: __init__, train, evaluate, save_model, load_model.
 """
 
-import io
-import pickle
-from unittest.mock import MagicMock, call, patch
+from contextlib import contextmanager
+from unittest.mock import MagicMock, patch
 
 import numpy as np
-import pandas as pd
 import pytest
 
 from src.pipelines.ml.services import (
@@ -16,19 +20,14 @@ from src.pipelines.ml.services import (
     ModelArtifact,
     ModelService,
 )
-from tests.conftest import _make_training_df, make_pickled_artifact, _PicklableModel
+from tests.conftest import _make_training_df
 
 
 @pytest.fixture
-def mock_s3_factory(mock_s3):
-    """Patch boto3.client to return our mock S3 object for all ModelService tests."""
-    with patch("src.pipelines.ml.services.boto3.client", return_value=mock_s3):
-        yield mock_s3
-
-
-@pytest.fixture
-def svc(mock_cfg, mock_s3_factory):
-    return ModelService(mock_cfg)
+def svc(mock_cfg):
+    # __init__ calls _set_mlflow_uri() → mlflow.set_tracking_uri(); patch to no-op.
+    with patch("mlflow.set_tracking_uri"):
+        return ModelService(mock_cfg)
 
 
 @pytest.fixture
@@ -40,45 +39,49 @@ def train_df_processed():
     return df
 
 
-# ── __init__ / _ensure_bucket ──────────────────────────────────────────────────
+@contextmanager
+def _mock_mlflow_logging(model_id="m-abc",
+                         artifact_location="s3://mlflow-artifacts/1/models/m-abc/artifacts",
+                         model_uri="models:/m-abc"):
+    """Patch the MLflow logging calls save_model() makes within an active run."""
+    info   = MagicMock(model_id=model_id, model_uri=model_uri)
+    logged = MagicMock(artifact_location=artifact_location)
+    with patch("mlflow.active_run", return_value=MagicMock()), \
+         patch("mlflow.sklearn.log_model", return_value=info) as log_model, \
+         patch("mlflow.get_logged_model", return_value=logged) as get_logged:
+        yield {"log_model": log_model, "get_logged": get_logged, "info": info}
+
+
+# ── __init__ ────────────────────────────────────────────────────────────────────
 
 class TestInit:
-    def test_s3_client_created_with_correct_params(self, mock_cfg, mock_s3):
-        with patch("src.pipelines.ml.services.boto3.client", return_value=mock_s3) as mock_client:
-            ModelService(mock_cfg)
-        mock_client.assert_called_once()
-        kwargs = mock_client.call_args[1]
-        assert kwargs["endpoint_url"] == mock_cfg["minio"]["endpoint_url"]
-        assert kwargs["aws_access_key_id"] == mock_cfg["minio"]["access_key"]
-        assert kwargs["aws_secret_access_key"] == mock_cfg["minio"]["secret_key"]
-
-    def test_ensure_bucket_calls_list_buckets(self, mock_cfg, mock_s3):
-        with patch("src.pipelines.ml.services.boto3.client", return_value=mock_s3):
-            ModelService(mock_cfg)
-        mock_s3.list_buckets.assert_called_once()
-
-    def test_bucket_created_when_not_exists(self, mock_cfg, mock_s3):
-        mock_s3.list_buckets.return_value = {"Buckets": []}  # no buckets
-        with patch("src.pipelines.ml.services.boto3.client", return_value=mock_s3):
-            ModelService(mock_cfg)
-        mock_s3.create_bucket.assert_called_once_with(Bucket="models")
-
-    def test_bucket_not_created_when_already_exists(self, mock_cfg, mock_s3):
-        mock_s3.list_buckets.return_value = {"Buckets": [{"Name": "models"}]}
-        with patch("src.pipelines.ml.services.boto3.client", return_value=mock_s3):
-            ModelService(mock_cfg)
-        mock_s3.create_bucket.assert_not_called()
-
-    def test_classifier_defaults_to_none(self, mock_cfg, mock_s3):
-        with patch("src.pipelines.ml.services.boto3.client", return_value=mock_s3):
+    def test_classifier_defaults_to_none(self, mock_cfg):
+        with patch("mlflow.set_tracking_uri"):
             svc = ModelService(mock_cfg)
         assert svc.classifier is None
 
-    def test_injected_classifier_stored(self, mock_cfg, mock_s3):
+    def test_injected_classifier_stored(self, mock_cfg):
         clf = MagicMock()
-        with patch("src.pipelines.ml.services.boto3.client", return_value=mock_s3):
+        with patch("mlflow.set_tracking_uri"):
             svc = ModelService(mock_cfg, classifier=clf)
         assert svc.classifier is clf
+
+    def test_tracking_uri_set_from_cfg(self, mock_cfg):
+        cfg = {**mock_cfg, "mlflow": {"tracking_uri": "http://mlflow:5000"}}
+        with patch("mlflow.set_tracking_uri") as mock_set:
+            ModelService(cfg)
+        mock_set.assert_called_with("http://mlflow:5000")
+
+    def test_model_name_from_cfg(self, mock_cfg):
+        cfg = {**mock_cfg, "mlflow": {"model_name": "custom-model"}}
+        with patch("mlflow.set_tracking_uri"):
+            svc = ModelService(cfg)
+        assert svc._model_name == "custom-model"
+
+    def test_model_name_defaults_when_absent(self, mock_cfg):
+        with patch("mlflow.set_tracking_uri"):
+            svc = ModelService(mock_cfg)  # mock_cfg has no "mlflow" key
+        assert svc._model_name == "fraud-xgboost"
 
 
 # ── train ──────────────────────────────────────────────────────────────────────
@@ -148,7 +151,7 @@ class TestTrain:
         MockXGB.assert_called_once()
 
 
-# ── evaluate ───────────────────────────────────────────────────────────────────
+# ── evaluate ─────────────────────────────────────────────────────────────────────
 
 class TestEvaluate:
     @pytest.fixture
@@ -204,90 +207,81 @@ class TestEvaluate:
         assert X_passed.shape == (len(eval_df), len(FEATURE_COLS))
 
 
-# ── save_model ─────────────────────────────────────────────────────────────────
+# ── save_model ────────────────────────────────────────────────────────────────────
 
 class TestSaveModel:
-    # Use _PicklableModel (not MagicMock) because save_model pickles the model
-    def test_returns_s3_path_string(self, svc, mock_s3_factory):
-        path = svc.save_model(_PicklableModel(), {"pr_auc": 0.85}, "v_20260101_120000")
-        assert path.startswith("s3://models/")
+    def test_returns_artifact_location(self, svc):
+        with _mock_mlflow_logging(artifact_location="s3://bkt/models/m-1/artifacts"):
+            uri = svc.save_model(MagicMock(), {"pr_auc": 0.85}, "v1")
+        assert uri == "s3://bkt/models/m-1/artifacts"
 
-    def test_path_contains_model_version(self, svc, mock_s3_factory):
-        version = "v_20260101_120000_abc"
-        path = svc.save_model(_PicklableModel(), {}, version)
-        assert version in path
+    def test_logs_model_with_name_model(self, svc):
+        model = MagicMock()
+        with _mock_mlflow_logging() as m:
+            svc.save_model(model, {}, "v1")
+        kwargs = m["log_model"].call_args[1]
+        assert kwargs["name"] == "model"
+        assert kwargs["sk_model"] is model
 
-    def test_s3_upload_called(self, svc, mock_s3_factory):
-        svc.save_model(_PicklableModel(), {}, "v_test")
-        mock_s3_factory.upload_fileobj.assert_called_once()
+    def test_resolves_artifact_via_logged_model(self, svc):
+        with _mock_mlflow_logging(model_id="m-xyz") as m:
+            svc.save_model(MagicMock(), {}, "v1")
+        m["get_logged"].assert_called_once_with("m-xyz")
 
-    def test_s3_key_format(self, svc, mock_s3_factory):
-        version = "v_test_123"
-        svc.save_model(_PicklableModel(), {}, version)
-        args, _ = mock_s3_factory.upload_fileobj.call_args
-        bucket, key = args[1], args[2]
-        assert bucket == "models"
-        assert f"fraud_xgb/{version}/model.pkl" == key
+    def test_raises_when_no_active_run(self, svc):
+        with patch("mlflow.active_run", return_value=None):
+            with pytest.raises(RuntimeError, match="active mlflow.start_run"):
+                svc.save_model(MagicMock(), {}, "v1")
 
-    def test_serialized_artifact_contains_model_and_feature_cols(self, svc, mock_s3_factory):
-        metrics = {"pr_auc": 0.85}
-        captured = {}
-
-        def capture_upload(buf, bucket, key):
-            buf.seek(0)
-            captured["artifact"] = pickle.loads(buf.read())
-
-        mock_s3_factory.upload_fileobj.side_effect = capture_upload
-        svc.save_model(_PicklableModel(), metrics, "v_check")
-
-        assert "model" in captured["artifact"]
-        assert "feature_cols" in captured["artifact"]
-        assert captured["artifact"]["feature_cols"] == FEATURE_COLS
-        assert captured["artifact"]["metrics"] == metrics
+    def test_falls_back_to_model_uri_when_logged_model_lookup_fails(self, svc):
+        info = MagicMock(model_id="m-abc", model_uri="models:/m-abc")
+        with patch("mlflow.active_run", return_value=MagicMock()), \
+             patch("mlflow.sklearn.log_model", return_value=info), \
+             patch("mlflow.get_logged_model", side_effect=RuntimeError("no logged model")):
+            uri = svc.save_model(MagicMock(), {}, "v1")
+        assert uri == "models:/m-abc"
 
 
-# ── load_model ─────────────────────────────────────────────────────────────────
+# ── load_model ────────────────────────────────────────────────────────────────────
 
 class TestLoadModel:
-    # Use picklable_artifact (real model) — MagicMock is not picklable
+    @contextmanager
+    def _mock_load(self, model=None):
+        with patch("mlflow.set_tracking_uri"), \
+             patch("mlflow.sklearn.load_model", return_value=model or MagicMock()) as load:
+            yield load
 
-    def test_returns_model_artifact(self, svc, mock_s3_factory, picklable_artifact):
-        pickled = make_pickled_artifact(picklable_artifact)
-        mock_s3_factory.get_object.return_value = {"Body": io.BytesIO(pickled)}
-        result = svc.load_model("s3://models/fraud_xgb/v_20260101/model.pkl")
+    def test_returns_model_artifact(self, svc):
+        with self._mock_load():
+            result = svc.load_model("models:/fraud-xgboost/Production")
         assert isinstance(result, ModelArtifact)
 
-    def test_model_version_extracted_from_path(self, svc, mock_s3_factory, picklable_artifact):
-        pickled = make_pickled_artifact(picklable_artifact)
-        mock_s3_factory.get_object.return_value = {"Body": io.BytesIO(pickled)}
-        result = svc.load_model("s3://models/fraud_xgb/v_20260101_120000/model.pkl")
-        assert result.model_version == "v_20260101_120000"
+    def test_loads_from_given_uri(self, svc):
+        with self._mock_load() as load:
+            svc.load_model("models:/fraud-xgboost/Production")
+        load.assert_called_once_with("models:/fraud-xgboost/Production")
 
-    def test_feature_cols_restored(self, svc, mock_s3_factory, picklable_artifact):
-        pickled = make_pickled_artifact(picklable_artifact)
-        mock_s3_factory.get_object.return_value = {"Body": io.BytesIO(pickled)}
-        result = svc.load_model("s3://models/fraud_xgb/v_test/model.pkl")
+    def test_feature_cols_restored(self, svc):
+        with self._mock_load():
+            result = svc.load_model("models:/fraud-xgboost/Production")
         assert result.feature_cols == FEATURE_COLS
 
-    def test_metrics_restored(self, svc, mock_s3_factory, picklable_artifact):
-        pickled = make_pickled_artifact(picklable_artifact)
-        mock_s3_factory.get_object.return_value = {"Body": io.BytesIO(pickled)}
-        result = svc.load_model("s3://models/fraud_xgb/v_test/model.pkl")
-        assert result.metrics == picklable_artifact.metrics
-
-    def test_s3_get_object_called_with_correct_key(self, svc, mock_s3_factory, picklable_artifact):
-        pickled = make_pickled_artifact(picklable_artifact)
-        mock_s3_factory.get_object.return_value = {"Body": io.BytesIO(pickled)}
-        svc.load_model("s3://models/fraud_xgb/v_test/model.pkl")
-        mock_s3_factory.get_object.assert_called_once_with(
-            Bucket="models", Key="fraud_xgb/v_test/model.pkl"
-        )
-
-    def test_missing_metrics_defaults_to_empty_dict(self, svc, mock_s3_factory):
-        # Old artifact format without 'metrics' key — must use picklable model
-        payload = {"model": _PicklableModel(), "feature_cols": FEATURE_COLS}
-        buf = io.BytesIO()
-        pickle.dump(payload, buf)
-        mock_s3_factory.get_object.return_value = {"Body": io.BytesIO(buf.getvalue())}
-        result = svc.load_model("s3://models/fraud_xgb/v_old/model.pkl")
+    def test_metrics_default_to_empty_dict(self, svc):
+        with self._mock_load():
+            result = svc.load_model("models:/fraud-xgboost/Production")
         assert result.metrics == {}
+
+    def test_version_from_models_stage_uri(self, svc):
+        with self._mock_load():
+            result = svc.load_model("models:/fraud-xgboost/Production")
+        assert result.model_version == "Production"
+
+    def test_version_from_runs_uri_is_run_id_prefix(self, svc):
+        with self._mock_load():
+            result = svc.load_model("runs:/abcdef1234567890/model")
+        assert result.model_version == "abcdef12"
+
+    def test_version_unknown_for_other_uri(self, svc):
+        with self._mock_load():
+            result = svc.load_model("s3://some/random/path")
+        assert result.model_version == "unknown"

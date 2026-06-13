@@ -1,0 +1,68 @@
+# Kafbat Kafka UI (read-only web console) for screenshots / inspection.
+# Lightweight single pod — connects to the Strimzi bootstrap service.
+#
+# Deploy:
+#   kubectl apply -f infra/k8s/kafka/kafka-ui.yaml
+#   kubectl rollout status deploy/kafka-ui -n fraud-infra
+#   kubectl port-forward svc/kafka-ui -n fraud-infra 8088:8080
+#   → open http://localhost:8088
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka-ui
+  namespace: fraud-infra
+  labels:
+    app: kafka-ui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka-ui
+  template:
+    metadata:
+      labels:
+        app: kafka-ui
+    spec:
+      containers:
+        - name: kafka-ui
+          image: ghcr.io/kafbat/kafka-ui:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: KAFKA_CLUSTERS_0_NAME
+              value: fraud-kafka
+            - name: KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS
+              value: fraud-kafka-kafka-bootstrap.fraud-infra.svc.cluster.local:9092
+            - name: DYNAMIC_CONFIG_ENABLED
+              value: "true"
+            # JVM heap cap — keep the UI small so it never contends for host RAM
+            - name: JAVA_OPTS
+              value: "-Xms128m -Xmx384m"
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 100m
+            limits:
+              memory: 512Mi
+              cpu: 500m
+          readinessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-ui
+  namespace: fraud-infra
+  labels:
+    app: kafka-ui
+spec:
+  selector:
+    app: kafka-ui
+  ports:
+    - port: 8080
+      targetPort: 8080

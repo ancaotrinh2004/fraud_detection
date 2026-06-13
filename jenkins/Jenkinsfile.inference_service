@@ -107,13 +107,9 @@ spec:
                 sh '''
                     python3 -m venv .ci-venv
                     .ci-venv/bin/pip install --upgrade pip
-                    .ci-venv/bin/pip install \
-                        ruff \
-                        pytest pytest-cov \
-                        numpy pandas scikit-learn xgboost \
-                        fastapi httpx pydantic uvicorn \
-                        sqlalchemy boto3 pyyaml \
-                        prometheus-fastapi-instrumentator
+                    # Project deps (mlflow, scikit-learn, xgboost, sqlalchemy, ...) + CI tooling.
+                    # kserve is NOT installed: the contract & load tests stub it in sys.modules.
+                    .ci-venv/bin/pip install -r requirements.txt ruff pytest-cov
                 '''
             }
         }
@@ -186,39 +182,46 @@ spec:
             steps {
                 sh '''
                     .ci-venv/bin/python - <<'PYEOF'
-import time, statistics
+import json, sys, time, types, statistics
 from unittest.mock import patch, MagicMock
 import numpy as np
 
-with patch("src.inference.server._load_model"), \
-     patch("src.inference.server._get_engine"):
-    from fastapi.testclient import TestClient
-    import src.inference.server as srv
+# The server is a KServe custom model. Stub `kserve` so it imports without the
+# heavy runtime — we only need kserve.Model as a base class here.
+if "kserve" not in sys.modules:
+    _kserve = types.ModuleType("kserve")
+    class _StubModel:
+        def __init__(self, name):
+            self.name, self.ready = name, False
+    _kserve.Model = _StubModel
+    _kserve.ModelServer = MagicMock()
+    sys.modules["kserve"] = _kserve
+
+from src.pipelines.ml.services import ModelArtifact, FEATURE_COLS
+from src.inference.server import FraudModel, MODEL_NAME
 
 mock_model = MagicMock()
 mock_model.predict_proba.return_value = np.array([[0.95, 0.05]])
+artifact = ModelArtifact(model=mock_model, feature_cols=FEATURE_COLS,
+                         model_version="v_load_test", metrics={"pr_auc": 0.85})
 
-from src.pipelines.ml.services import ModelArtifact, FEATURE_COLS
-mock_artifact = ModelArtifact(
-    model=mock_model,
-    feature_cols=FEATURE_COLS,
-    model_version="v_load_test",
-    metrics={"pr_auc": 0.85},
-)
+model = FraudModel(MODEL_NAME)
+model._artifact = artifact
+model._engine = MagicMock()
+model.ready = True
 
-PAYLOAD = {
-    "instances": [{"customer_id": "C0000001", "txn_amount": 150.0, "txn_hour": 14}]
-}
+# KServe V2 infer payload — one JSON-encoded instance.
+PAYLOAD = {"inputs": [{"name": "instances", "datatype": "BYTES", "shape": [1],
+                       "data": [json.dumps({"customer_id": "C0000001",
+                                            "txn_amount": 150.0, "txn_hour": 14})]}]}
 
 latencies_ms = []
-with patch.object(srv, "_artifact", mock_artifact), \
-     patch.object(srv, "_fetch_features", return_value={c: 0.0 for c in FEATURE_COLS}):
-    client = TestClient(srv.app, raise_server_exceptions=True)
+with patch.object(model, "_fetch_features", return_value={c: 0.0 for c in FEATURE_COLS}):
     for _ in range(100):
         t0 = time.perf_counter()
-        r = client.post("/v1/models/fraud:predict", json=PAYLOAD)
+        resp = model.predict(PAYLOAD)
         latencies_ms.append((time.perf_counter() - t0) * 1000)
-        assert r.status_code == 200, f"Unexpected status {r.status_code}"
+        assert resp["outputs"][0]["shape"] == [1], f"Unexpected response: {resp}"
 
 p95 = statistics.quantiles(latencies_ms, n=100)[94]
 p50 = statistics.median(latencies_ms)
@@ -231,7 +234,7 @@ PYEOF
             }
         }
 
-        // ── CD — Build & push ─────────────────────────────────────────────────────
+        // ── CD — Build & push (Dockerfile) ─────────────────────────────────────
         stage('Build Inference Image') {
             when {
                 allOf {
@@ -393,11 +396,11 @@ PYEOF
                         http://localhost:18080/v2/health/ready)
                     echo "/v2/health/ready → HTTP \$STATUS"
 
-                    echo "--- Inference smoke ---"
-                    curl -s -X POST http://localhost:18080/v1/models/fraud:predict \\
+                    echo "--- Inference smoke (KServe V2) ---"
+                    curl -s -X POST http://localhost:18080/v2/models/fraud-predictor/infer \\
                         -H "Content-Type: application/json" \\
-                        -d '{"instances":[{"customer_id":"smoke-test","txn_amount":100.0,"txn_hour":10}]}' | \\
-                        python3 -c "import sys,json; d=json.load(sys.stdin); print(d); assert 'predictions' in d"
+                        -d '{"inputs":[{"name":"instances","datatype":"BYTES","shape":[1],"data":["{\\"customer_id\\": \\"smoke-test\\", \\"txn_amount\\": 100.0, \\"txn_hour\\": 10}"]}]}' | \\
+                        python3 -c "import sys,json; d=json.load(sys.stdin); print(d); assert d['outputs'][0]['data'], 'no predictions in V2 response'"
 
                     kill \$PF_PID 2>/dev/null || true
 

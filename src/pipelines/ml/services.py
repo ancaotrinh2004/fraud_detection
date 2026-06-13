@@ -1,25 +1,20 @@
 """
 src/pipelines/ml/services.py
 
-Five core ML service classes as defined in design/04.1_ml_design.md Section 4:
+Five core ML service classes:
   - TrainingDataService
-  - ModelService
-  - ModelRegistryService
+  - ModelService        (MLflow artifact logging/loading)
+  - ModelRegistryService (MLflow Model Registry — replaces PostgreSQL ml_model_registry)
   - ScoringService
-  - MonitoringService
+  - MonitoringService   (Discord alerts)
 """
 
-import io
 import logging
-import pickle
-import uuid
 from datetime import datetime
 from typing import NamedTuple
 
-import boto3
 import numpy as np
 import pandas as pd
-from botocore.client import Config
 from sklearn.metrics import (
     average_precision_score, f1_score, precision_score, recall_score,
 )
@@ -28,7 +23,7 @@ from sqlalchemy import text
 logger = logging.getLogger(__name__)
 
 SCHEMA       = "gold_fraud"
-MODEL_NAME   = "fraud_xgb"
+MODEL_NAME   = "fraud-xgboost"
 SCORE_THRESH = 0.5
 
 
@@ -90,6 +85,7 @@ class LogisticRegressionClassifier(BaseClassifier):
     def get_model(self):
         return self._model
 
+
 # Columns that must exist in ml_fraud_training (stored in DB)
 _DB_FEATURE_COLS = [
     "f_customer_total_txn_90d",
@@ -111,8 +107,8 @@ _DB_FEATURE_COLS = [
 
 # Full feature set used for training/scoring (DB columns + derived)
 FEATURE_COLS = _DB_FEATURE_COLS + [
-    "txn_amount_ratio",  # txn_amount / avg_90d — captures 3× anomaly condition
-    "is_night_txn",      # hour 22-5 — matches night fraud condition
+    "txn_amount_ratio",  # txn_amount / avg_90d
+    "is_night_txn",      # hour 1–4
 ]
 
 
@@ -130,15 +126,15 @@ class TrainingDataService:
 
     def read_training_table(self, engine) -> pd.DataFrame:
         df = pd.read_sql(
-            f"SELECT * FROM {SCHEMA}.ml_fraud_training ORDER BY event_timestamp",
+            f"SELECT * FROM {SCHEMA}.ml_fraud_training ORDER BY event_ts",
             engine,
         )
-        df["event_timestamp"] = pd.to_datetime(df["event_timestamp"])
+        df["event_ts"] = pd.to_datetime(df["event_ts"])
         logger.info(f"[TrainingDataService] Loaded {len(df):,} rows.")
         return df
 
     def validate_schema(self, df: pd.DataFrame) -> None:
-        missing = [c for c in _DB_FEATURE_COLS + ["label", "event_timestamp"] if c not in df.columns]
+        missing = [c for c in _DB_FEATURE_COLS + ["label", "event_ts"] if c not in df.columns]
         if missing:
             raise ValueError(f"Missing columns in training table: {missing}")
         if df["label"].isna().any():
@@ -151,8 +147,7 @@ class TrainingDataService:
         train_frac: float = 0.70,
         val_frac: float   = 0.15,
     ) -> dict:
-        """Compute time-based split boundaries from actual data — works for any date range."""
-        sorted_ts = df["event_timestamp"].sort_values()
+        sorted_ts = df["event_ts"].sort_values()
         n = len(sorted_ts)
         return {
             "train_end": sorted_ts.iloc[int(n * train_frac)],
@@ -169,9 +164,9 @@ class TrainingDataService:
         train_cut  = boundaries["train_end"]
         val_cut    = boundaries["val_end"]
 
-        train = df[df["event_timestamp"] <  train_cut]
-        val   = df[(df["event_timestamp"] >= train_cut) & (df["event_timestamp"] < val_cut)]
-        test  = df[df["event_timestamp"] >= val_cut]
+        train = df[df["event_ts"] <  train_cut]
+        val   = df[(df["event_ts"] >= train_cut) & (df["event_ts"] < val_cut)]
+        test  = df[df["event_ts"] >= val_cut]
         logger.info(
             f"[TrainingDataService] Split — train:{len(train):,} (<{train_cut.date()}) "
             f"val:{len(val):,} test:{len(test):,} (>={val_cut.date()})"
@@ -180,16 +175,12 @@ class TrainingDataService:
 
     def handle_missing_features(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
-        # Drop rows with no customer aggregate snapshot.
-        # April/May transactions with 0-filled 90d features corrupt training because
-        # both fraud and non-fraud get identical zero vectors — model learns nothing.
         has_cust_history = df["f_customer_avg_txn_amount_90d"].notna()
         dropped = int((~has_cust_history).sum())
         if dropped:
             logger.info(f"[TrainingDataService] Dropped {dropped:,} rows lacking customer feature snapshot.")
         df = df[has_cust_history].copy()
 
-        # Derived features — safe division guards against zero avg (new customers)
         df["txn_amount_ratio"] = (
             df["txn_amount"] / df["f_customer_avg_txn_amount_90d"].replace(0, np.nan)
         ).fillna(0)
@@ -202,28 +193,20 @@ class TrainingDataService:
 # ── ModelService ───────────────────────────────────────────────────────────────
 
 class ModelService:
-    """Strategy + Learner patterns: accepts any BaseClassifier; exposes unified train()/evaluate() API."""
+    """Handles training, evaluation, and MLflow artifact logging/loading."""
 
     def __init__(self, cfg: dict, classifier: BaseClassifier | None = None):
-        self.classifier = classifier  # injected strategy; resolved lazily in train()
-        minio = cfg["minio"]
-        self._s3 = boto3.client(
-            "s3",
-            endpoint_url=minio["endpoint_url"],
-            aws_access_key_id=minio["access_key"],
-            aws_secret_access_key=minio["secret_key"],
-            config=Config(signature_version="s3v4"),
-            region_name="us-east-1",
-        )
-        self._ensure_bucket()
+        self.classifier = classifier
+        mlflow_cfg = cfg.get("mlflow", {})
+        self._tracking_uri = mlflow_cfg.get("tracking_uri", "http://localhost:5000")
+        self._model_name   = mlflow_cfg.get("model_name", MODEL_NAME)
+        self._set_mlflow_uri()
 
-    def _ensure_bucket(self):
-        existing = {b["Name"] for b in self._s3.list_buckets().get("Buckets", [])}
-        if "models" not in existing:
-            self._s3.create_bucket(Bucket="models")
+    def _set_mlflow_uri(self) -> None:
+        import mlflow
+        mlflow.set_tracking_uri(self._tracking_uri)
 
     def train(self, train_df: pd.DataFrame) -> object:
-        """Learner pattern: single unified fit() call; strategy resolved here."""
         X = train_df[FEATURE_COLS].values
         y = train_df["label"].values
 
@@ -258,111 +241,159 @@ class ModelService:
         return metrics
 
     def save_model(self, model, metrics: dict, model_version: str) -> str:
-        """Pickle model to MinIO. Returns s3 artifact path."""
-        artifact = {"model": model, "feature_cols": FEATURE_COLS, "metrics": metrics}
-        buf = io.BytesIO()
-        pickle.dump(artifact, buf)
-        buf.seek(0)
-        key = f"fraud_xgb/{model_version}/model.pkl"
-        self._s3.upload_fileobj(buf, "models", key)
-        path = f"s3://models/{key}"
-        logger.info(f"[ModelService] Saved artifact → {path}")
-        return path
+        """Log model artifact to the active MLflow run. Returns artifact URI for registry."""
+        import mlflow
+        import mlflow.sklearn
+        active = mlflow.active_run()
+        if active is None:
+            raise RuntimeError("save_model() must be called within an active mlflow.start_run() context.")
+
+        # MLflow 3.x stores Logged Model artifacts at models/m-<id>/artifacts/ under the
+        # artifact root, NOT at <run_id>/artifacts/model/. ModelInfo no longer exposes
+        # `artifact_uri`; resolve the physical storage location via the LoggedModel so
+        # the registry's create_model_version() gets a real S3 source path (not a
+        # "models:/m-..." logical URI, which 500s on the SQLite-backed server).
+        model_info = mlflow.sklearn.log_model(sk_model=model, name="model")
+
+        artifact_uri = None
+        model_id = getattr(model_info, "model_id", None)
+        if model_id:
+            try:
+                logged_model = mlflow.get_logged_model(model_id)
+                artifact_uri = logged_model.artifact_location
+            except Exception as e:  # pragma: no cover - version/shape fallback
+                logger.warning(f"[ModelService] get_logged_model({model_id}) failed: {e}")
+        if not artifact_uri:
+            # Fallback for older MLflow or unexpected ModelInfo shapes.
+            artifact_uri = getattr(model_info, "model_uri", None) or getattr(
+                model_info, "artifact_path", None
+            )
+
+        logger.info(f"[ModelService] Model logged → {artifact_uri}")
+        return artifact_uri
 
     def load_model(self, artifact_path: str) -> ModelArtifact:
-        """Load model artifact from MinIO given s3://models/... path."""
-        key = artifact_path.replace("s3://models/", "")
-        obj = self._s3.get_object(Bucket="models", Key=key)
-        artifact = pickle.loads(obj["Body"].read())
-        # artifact_path contains model_version in the key
-        model_version = key.split("/")[1]
+        """Load model from MLflow registry URI or run URI."""
+        import mlflow.sklearn
+        self._set_mlflow_uri()
+        model = mlflow.sklearn.load_model(artifact_path)
+
+        # Derive a readable version label from the URI
+        if artifact_path.startswith("models:/"):
+            parts = artifact_path.replace("models:/", "").split("/")
+            version = parts[1] if len(parts) > 1 else "unknown"
+        elif artifact_path.startswith("runs:/"):
+            version = artifact_path.split("/")[1][:8]
+        else:
+            version = "unknown"
+
         return ModelArtifact(
-            model=artifact["model"],
-            feature_cols=artifact["feature_cols"],
-            model_version=model_version,
-            metrics=artifact.get("metrics", {}),
+            model=model,
+            feature_cols=FEATURE_COLS,
+            model_version=version,
+            metrics={},
         )
 
 
 # ── ModelRegistryService ───────────────────────────────────────────────────────
 
 class ModelRegistryService:
-    """Lightweight model registry backed by gold_fraud.ml_model_registry."""
+    """MLflow Model Registry — replaces PostgreSQL ml_model_registry table."""
 
-    def __init__(self, engine):
-        self._engine = engine
+    def __init__(self, cfg: dict):
+        import mlflow
+        mlflow_cfg = cfg.get("mlflow", {})
+        self._tracking_uri = mlflow_cfg.get("tracking_uri", "http://localhost:5000")
+        self._model_name   = mlflow_cfg.get("model_name", MODEL_NAME)
+        mlflow.set_tracking_uri(self._tracking_uri)
+        self._client = mlflow.tracking.MlflowClient()
 
     def register(
         self,
-        model_version: str,
+        run_id: str,
         metrics: dict,
         artifact_path: str,
         train_rows: int,
         status: str = "candidate",
-    ) -> None:
-        with self._engine.begin() as conn:
-            conn.execute(text(f"""
-                INSERT INTO {SCHEMA}.ml_model_registry
-                    (model_version, model_name, pr_auc, f1_score, precision_score,
-                     recall_score, status, artifact_path, train_rows)
-                VALUES (:ver, :name, :pr_auc, :f1, :prec, :rec, :status, :path, :rows)
-                ON CONFLICT (model_version) DO UPDATE SET
-                    status = EXCLUDED.status,
-                    registered_ts = NOW()
-            """), {
-                "ver": model_version, "name": MODEL_NAME,
-                "pr_auc": metrics["pr_auc"],
-                "f1":     metrics["f1"],
-                "prec":   metrics["precision"],
-                "rec":    metrics["recall"],
-                "status": status,
-                "path":   artifact_path,
-                "rows":   train_rows,
-            })
-        logger.info(f"[ModelRegistryService] Registered {model_version} as '{status}'.")
+    ) -> str:
+        """Register a logged model run to the MLflow Model Registry. Returns version string."""
+        from mlflow.exceptions import MlflowException
+
+        # Ensure registered model exists before creating a version
+        try:
+            self._client.create_registered_model(self._model_name)
+        except MlflowException:
+            pass  # Already exists
+
+        # artifact_path is the actual S3 path returned by ModelService.save_model()
+        # (e.g., s3://mlflow-artifacts/1/models/m-<id>/artifacts).
+        # Using create_model_version() directly avoids register_model() which in MLflow 3.x
+        # resolves to a "models:/m-..." Logged Model URI causing 500s on SQLite-backed server.
+        source = artifact_path
+        mv = self._client.create_model_version(
+            name=self._model_name,
+            source=source,
+            run_id=run_id,
+        )
+        stage = "Staging" if status == "candidate" else "Production"
+        self._client.transition_model_version_stage(
+            name=self._model_name,
+            version=mv.version,
+            stage=stage,
+            archive_existing_versions=False,
+        )
+        self._client.set_model_version_tag(self._model_name, mv.version, "pr_auc", str(metrics.get("pr_auc", 0)))
+        self._client.set_model_version_tag(self._model_name, mv.version, "f1",     str(metrics.get("f1", 0)))
+        self._client.set_model_version_tag(self._model_name, mv.version, "train_rows", str(train_rows))
+        logger.info(f"[ModelRegistryService] Registered version {mv.version} as '{stage}'.")
+        return str(mv.version)
 
     def get_production_version(self) -> dict | None:
-        """Return {'model_version', 'pr_auc', 'artifact_path'} of production model or None."""
-        with self._engine.connect() as conn:
-            row = conn.execute(text(f"""
-                SELECT model_version, pr_auc, artifact_path
-                FROM {SCHEMA}.ml_model_registry
-                WHERE status = 'production' AND model_name = :n
-                ORDER BY registered_ts DESC LIMIT 1
-            """), {"n": MODEL_NAME}).fetchone()
-        if row:
-            return {"model_version": row[0], "pr_auc": float(row[1]), "artifact_path": row[2]}
-        return None
+        """Return {'model_version', 'pr_auc', 'artifact_path'} for the Production model, or None."""
+        try:
+            versions = self._client.get_latest_versions(self._model_name, stages=["Production"])
+        except Exception:
+            # Registered model doesn't exist yet (first training run)
+            return None
+        if not versions:
+            return None
+        v = versions[0]
+        try:
+            run = self._client.get_run(v.run_id)
+            pr_auc = float(run.data.metrics.get("pr_auc", 0.0))
+        except Exception:
+            pr_auc = float(v.tags.get("pr_auc", 0.0))
+
+        artifact_path = f"models:/{self._model_name}/Production"
+        return {
+            "model_version": v.version,
+            "pr_auc":        pr_auc,
+            "artifact_path": artifact_path,
+        }
 
     def promote(self, model_version: str) -> None:
-        with self._engine.begin() as conn:
-            conn.execute(text(f"""
-                UPDATE {SCHEMA}.ml_model_registry
-                SET status = 'retired'
-                WHERE status = 'production' AND model_name = :n
-            """), {"n": MODEL_NAME})
-            conn.execute(text(f"""
-                UPDATE {SCHEMA}.ml_model_registry
-                SET status = 'production'
-                WHERE model_version = :ver
-            """), {"ver": model_version})
-        logger.info(f"[ModelRegistryService] Promoted {model_version} to production.")
+        """Transition the given version to Production, archiving all previous Production versions."""
+        self._client.transition_model_version_stage(
+            name=self._model_name,
+            version=str(model_version),
+            stage="Production",
+            archive_existing_versions=True,
+        )
+        logger.info(f"[ModelRegistryService] Promoted version {model_version} to Production.")
 
     def rollback(self, previous_version: str) -> None:
         self.promote(previous_version)
-        logger.info(f"[ModelRegistryService] Rolled back to {previous_version}.")
+        logger.info(f"[ModelRegistryService] Rolled back to version {previous_version}.")
 
 
 # ── ScoringService ─────────────────────────────────────────────────────────────
 
 class ScoringService:
-    """Batch and online scoring against registered model."""
+    """Batch and online scoring against a loaded ModelArtifact."""
 
     def score_batch(self, artifact: ModelArtifact, df: pd.DataFrame,
                     chunk_size: int = 5_000) -> pd.DataFrame:
-        """Iterator pattern: processes df in chunk_size chunks for memory efficiency."""
         df = df.copy()
-        # Derived features — mirror logic in handle_missing_features
         df["txn_amount_ratio"] = (
             df["txn_amount"] / df["f_customer_avg_txn_amount_90d"].replace(0, np.nan)
         ).fillna(0)
@@ -373,7 +404,7 @@ class ScoringService:
         for start in range(0, len(df), chunk_size):
             chunk = df.iloc[start:start + chunk_size]
             X = chunk[artifact.feature_cols].fillna(0).values
-            scores = model.predict_proba(X)[:, 1]  # type: ignore[union-attr]
+            scores = model.predict_proba(X)[:, 1]
             all_scores.append(scores)
         return pd.DataFrame({
             "transaction_id": df["transaction_id"].values,
@@ -383,7 +414,6 @@ class ScoringService:
         })
 
     def write_scores(self, score_df: pd.DataFrame, engine) -> None:
-        """Upsert scores to ml_fraud_scores — idempotent."""
         records = score_df.to_dict("records")
         with engine.begin() as conn:
             for chunk_start in range(0, len(records), 5000):
@@ -400,9 +430,8 @@ class ScoringService:
         logger.info(f"[ScoringService] Upserted {len(score_df):,} scores.")
 
     def score_online(self, artifact: ModelArtifact, features: dict) -> dict:
-        """Score a single transaction for online inference. Returns score + metadata."""
         X = np.array([[features.get(c, 0) for c in artifact.feature_cols]])
-        score = float(artifact.model.predict_proba(X)[0, 1])  # type: ignore[union-attr]
+        score = float(artifact.model.predict_proba(X)[0, 1])
         return {
             "fraud_score":   round(score, 4),
             "model_version": artifact.model_version,
@@ -412,31 +441,26 @@ class ScoringService:
 # ── MonitoringService ──────────────────────────────────────────────────────────
 
 class MonitoringService:
-    """Publishes model and data quality metrics, checks retrain triggers."""
+    """Publishes model metrics, checks retrain triggers, sends Discord alerts."""
 
-    def __init__(self, engine):
+    def __init__(self, engine, cfg: dict | None = None):
         self._engine = engine
+        self._webhook_url = (cfg or {}).get("alerting", {}).get("discord_webhook_url", "")
 
     def publish_model_metrics(self, metrics: dict, model_version: str) -> None:
         logger.info(
-            f"[MonitoringService] Model metrics for {model_version}: "
+            f"[MonitoringService] Metrics for {model_version}: "
             + ", ".join(f"{k}={v}" for k, v in metrics.items())
         )
 
     def check_retrain_trigger(
         self,
-        psi_threshold: float = 0.025,
+        psi_threshold: float = 0.1,
         consecutive_weeks: int = 3,
         f1_drop_threshold: float = 0.05,
     ) -> tuple[bool, str]:
-        """
-        Returns (should_retrain, reason).
-        Checks:
-          1. ≥ consecutive_weeks with PSI > psi_threshold
-          2. Current production F1 vs registered baseline drops > f1_drop_threshold
-        """
+        """Returns (should_retrain, reason). Checks consecutive drift alert weeks."""
         with self._engine.connect() as conn:
-            # Check consecutive drift alerts
             row = conn.execute(text(f"""
                 SELECT COUNT(*) FROM (
                     SELECT monitoring_date
@@ -456,7 +480,24 @@ class MonitoringService:
         return False, "no trigger"
 
     def trigger_alerts(self, metrics: dict) -> None:
+        from src.pipelines.utils.alerting import send_discord_alert
         if metrics.get("pr_auc", 1.0) < 0.70:
             logger.error(f"[MonitoringService] ALERT: PR-AUC={metrics['pr_auc']} below 0.70!")
+            send_discord_alert(
+                title="ALERT: Model PR-AUC below threshold",
+                message=(
+                    f"**PR-AUC**: {metrics['pr_auc']:.4f} (threshold: 0.70)\n"
+                    f"**F1**: {metrics.get('f1', 'N/A')}\n"
+                    f"**Precision**: {metrics.get('precision', 'N/A')}"
+                ),
+                level="critical",
+                webhook_url=self._webhook_url,
+            )
         if metrics.get("f1", 1.0) < 0.30:
             logger.warning(f"[MonitoringService] ALERT: F1={metrics['f1']} below 0.30!")
+            send_discord_alert(
+                title="WARNING: Low F1 score after training",
+                message=f"**F1**: {metrics['f1']:.4f} (threshold: 0.30)",
+                level="warning",
+                webhook_url=self._webhook_url,
+            )

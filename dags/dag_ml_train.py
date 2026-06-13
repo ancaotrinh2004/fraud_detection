@@ -12,10 +12,15 @@ ml_training      = Asset(f"{_PG}/ml_fraud_training")
 ml_registry      = Asset(f"{_PG}/ml_model_registry")
 
 _env = [
-    k8s.V1EnvVar(name="PYTHONPATH",       value="/opt/airflow"),
-    k8s.V1EnvVar(name="POSTGRES_PASSWORD", value="fraud_pass"),
-    k8s.V1EnvVar(name="MINIO_ACCESS_KEY",  value="fraud_minio_user"),
-    k8s.V1EnvVar(name="MINIO_SECRET_KEY",  value="fraud_minio_pass"),
+    k8s.V1EnvVar(name="PYTHONPATH",              value="/opt/airflow"),
+    k8s.V1EnvVar(name="POSTGRES_PASSWORD",        value="fraud_pass"),
+    k8s.V1EnvVar(name="MINIO_ACCESS_KEY",         value="fraud_minio_user"),
+    k8s.V1EnvVar(name="MINIO_SECRET_KEY",         value="fraud_minio_pass"),
+    # MLflow artifact store: boto3 requires AWS_ prefix, not MINIO_
+    k8s.V1EnvVar(name="AWS_ACCESS_KEY_ID",        value="fraud_minio_user"),
+    k8s.V1EnvVar(name="AWS_SECRET_ACCESS_KEY",    value="fraud_minio_pass"),
+    k8s.V1EnvVar(name="MLFLOW_S3_ENDPOINT_URL",   value="http://fraud-minio.fraud-infra.svc.cluster.local:9000"),
+    k8s.V1EnvVar(name="MLFLOW_TRACKING_URI",      value="http://mlflow.fraud-infra.svc.cluster.local:5000"),
 ]
 
 _resources = k8s.V1ResourceRequirements(
@@ -26,7 +31,7 @@ _resources = k8s.V1ResourceRequirements(
 _volume_mounts = [
     k8s.V1VolumeMount(
         name="pipeline-config",
-        mount_path="/opt/airflow/config/pipeline_config.yaml",
+        mount_path="/opt/airflow/configs/pipeline_config.yaml",
         sub_path="pipeline_config.yaml",
         read_only=True,
     )

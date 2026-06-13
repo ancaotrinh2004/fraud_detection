@@ -9,6 +9,7 @@ Tests verify the full pipeline control flow including:
   - Error in any step: log_run called with 'failed', exception re-raised
 """
 
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -35,10 +36,19 @@ def pipeline_mocks(mock_cfg, mock_engine, training_df):
     data_svc.handle_missing_features.return_value = training_df
     data_svc.split_by_time.return_value = splits
 
+    # Numeric hyperparameter attrs so train.py's `float(model.learning_rate)` etc.
+    # (logged to MLflow when hasattr(model, "n_estimators")) don't blow up on a bare mock.
+    trained = MagicMock(name="trained_model")
+    trained.n_estimators    = 300
+    trained.max_depth       = 6
+    trained.learning_rate   = 0.05
+    trained.scale_pos_weight = 49.0
+
     model_svc = MagicMock()
-    model_svc.train.return_value = MagicMock(name="trained_model")
+    model_svc.train.return_value = trained
     model_svc.evaluate.return_value = GOOD_METRICS.copy()
-    model_svc.save_model.return_value = "s3://models/fraud_xgb/v_test/model.pkl"
+    # save_model now returns the MLflow logged-model artifact location (opaque to the pipeline).
+    model_svc.save_model.return_value = "s3://mlflow-artifacts/1/models/m-test/artifacts"
 
     registry_svc = MagicMock()
     registry_svc.get_production_version.return_value = {"pr_auc": 0.80, "model_version": "v_old"}
@@ -55,16 +65,33 @@ def pipeline_mocks(mock_cfg, mock_engine, training_df):
     }
 
 
-def _run_with_mocks(mocks):
-    from src.pipelines.ml.train import run_training
+@contextmanager
+def _patched(mocks):
+    """Patch every external dependency of run_training() in one place.
+
+    Besides the service classes, run_training() also touches mlflow (start_run /
+    log_*), send_discord_alert, and validate_contract — all of which make network
+    or filesystem calls and must be stubbed. Yields the patch handles tests assert on.
+    """
     with patch(f"{TRAIN_MODULE}.load_pipeline_config", return_value=mocks["cfg"]), \
          patch(f"{TRAIN_MODULE}.get_sqlalchemy_engine", return_value=mocks["engine"]), \
-         patch(f"{TRAIN_MODULE}.log_run"), \
-         patch(f"{TRAIN_MODULE}.push_metrics"), \
+         patch(f"{TRAIN_MODULE}.log_run") as mock_log, \
+         patch(f"{TRAIN_MODULE}.push_metrics") as mock_push, \
+         patch(f"{TRAIN_MODULE}.send_discord_alert") as mock_alert, \
+         patch(f"{TRAIN_MODULE}.validate_contract"), \
+         patch(f"{TRAIN_MODULE}.mlflow") as mock_mlflow, \
          patch(f"{TRAIN_MODULE}.TrainingDataService", return_value=mocks["data"]), \
          patch(f"{TRAIN_MODULE}.ModelService", return_value=mocks["model"]), \
          patch(f"{TRAIN_MODULE}.ModelRegistryService", return_value=mocks["registry"]), \
          patch(f"{TRAIN_MODULE}.MonitoringService", return_value=mocks["monitor"]):
+        # `with mlflow.start_run() as run:` → run.info.run_id must be a real string.
+        mock_mlflow.start_run.return_value.__enter__.return_value.info.run_id = "run_test_123"
+        yield {"log": mock_log, "push": mock_push, "alert": mock_alert, "mlflow": mock_mlflow}
+
+
+def _run_with_mocks(mocks):
+    from src.pipelines.ml.train import run_training
+    with _patched(mocks):
         run_training()
 
 
@@ -119,31 +146,17 @@ class TestRunTrainingHappyPath:
 
     def test_calls_log_run_success(self, pipeline_mocks):
         from src.pipelines.ml.train import run_training
-        with patch(f"{TRAIN_MODULE}.load_pipeline_config", return_value=pipeline_mocks["cfg"]), \
-             patch(f"{TRAIN_MODULE}.get_sqlalchemy_engine", return_value=pipeline_mocks["engine"]), \
-             patch(f"{TRAIN_MODULE}.log_run") as mock_log, \
-             patch(f"{TRAIN_MODULE}.push_metrics"), \
-             patch(f"{TRAIN_MODULE}.TrainingDataService", return_value=pipeline_mocks["data"]), \
-             patch(f"{TRAIN_MODULE}.ModelService", return_value=pipeline_mocks["model"]), \
-             patch(f"{TRAIN_MODULE}.ModelRegistryService", return_value=pipeline_mocks["registry"]), \
-             patch(f"{TRAIN_MODULE}.MonitoringService", return_value=pipeline_mocks["monitor"]):
+        with _patched(pipeline_mocks) as p:
             run_training()
-        mock_log.assert_called_once()
-        assert mock_log.call_args[0][3] == "success"
+        p["log"].assert_called_once()
+        assert p["log"].call_args[0][3] == "success"
 
     def test_pushes_metrics_after_success(self, pipeline_mocks):
         from src.pipelines.ml.train import run_training
-        with patch(f"{TRAIN_MODULE}.load_pipeline_config", return_value=pipeline_mocks["cfg"]), \
-             patch(f"{TRAIN_MODULE}.get_sqlalchemy_engine", return_value=pipeline_mocks["engine"]), \
-             patch(f"{TRAIN_MODULE}.log_run"), \
-             patch(f"{TRAIN_MODULE}.push_metrics") as mock_push, \
-             patch(f"{TRAIN_MODULE}.TrainingDataService", return_value=pipeline_mocks["data"]), \
-             patch(f"{TRAIN_MODULE}.ModelService", return_value=pipeline_mocks["model"]), \
-             patch(f"{TRAIN_MODULE}.ModelRegistryService", return_value=pipeline_mocks["registry"]), \
-             patch(f"{TRAIN_MODULE}.MonitoringService", return_value=pipeline_mocks["monitor"]):
+        with _patched(pipeline_mocks) as p:
             run_training()
-        mock_push.assert_called_once()
-        pushed_metrics = mock_push.call_args[0][1]
+        p["push"].assert_called_once()
+        pushed_metrics = p["push"].call_args[0][1]
         assert "fraud_model_pr_auc" in pushed_metrics
 
 
@@ -168,18 +181,11 @@ class TestRunTrainingPrAucBelowThreshold:
     def test_logs_failure_when_pr_auc_below_threshold(self, pipeline_mocks):
         pipeline_mocks["model"].evaluate.return_value = WEAK_METRICS.copy()
         from src.pipelines.ml.train import run_training
-        with patch(f"{TRAIN_MODULE}.load_pipeline_config", return_value=pipeline_mocks["cfg"]), \
-             patch(f"{TRAIN_MODULE}.get_sqlalchemy_engine", return_value=pipeline_mocks["engine"]), \
-             patch(f"{TRAIN_MODULE}.log_run") as mock_log, \
-             patch(f"{TRAIN_MODULE}.push_metrics"), \
-             patch(f"{TRAIN_MODULE}.TrainingDataService", return_value=pipeline_mocks["data"]), \
-             patch(f"{TRAIN_MODULE}.ModelService", return_value=pipeline_mocks["model"]), \
-             patch(f"{TRAIN_MODULE}.ModelRegistryService", return_value=pipeline_mocks["registry"]), \
-             patch(f"{TRAIN_MODULE}.MonitoringService", return_value=pipeline_mocks["monitor"]):
+        with _patched(pipeline_mocks) as p:
             with pytest.raises(ValueError):
                 run_training()
-        mock_log.assert_called_once()
-        assert mock_log.call_args[0][3] == "failed"
+        p["log"].assert_called_once()
+        assert p["log"].call_args[0][3] == "failed"
 
 
 class TestRunTrainingFirstRun:
@@ -214,18 +220,11 @@ class TestRunTrainingErrorHandling:
     def test_exception_in_data_load_logged_as_failed(self, pipeline_mocks):
         pipeline_mocks["data"].read_training_table.side_effect = RuntimeError("DB unreachable")
         from src.pipelines.ml.train import run_training
-        with patch(f"{TRAIN_MODULE}.load_pipeline_config", return_value=pipeline_mocks["cfg"]), \
-             patch(f"{TRAIN_MODULE}.get_sqlalchemy_engine", return_value=pipeline_mocks["engine"]), \
-             patch(f"{TRAIN_MODULE}.log_run") as mock_log, \
-             patch(f"{TRAIN_MODULE}.push_metrics"), \
-             patch(f"{TRAIN_MODULE}.TrainingDataService", return_value=pipeline_mocks["data"]), \
-             patch(f"{TRAIN_MODULE}.ModelService", return_value=pipeline_mocks["model"]), \
-             patch(f"{TRAIN_MODULE}.ModelRegistryService", return_value=pipeline_mocks["registry"]), \
-             patch(f"{TRAIN_MODULE}.MonitoringService", return_value=pipeline_mocks["monitor"]):
+        with _patched(pipeline_mocks) as p:
             with pytest.raises(RuntimeError):
                 run_training()
-        mock_log.assert_called_once()
-        assert mock_log.call_args[0][3] == "failed"
+        p["log"].assert_called_once()
+        assert p["log"].call_args[0][3] == "failed"
 
     def test_exception_in_train_step_re_raised(self, pipeline_mocks):
         pipeline_mocks["model"].train.side_effect = MemoryError("OOM")
