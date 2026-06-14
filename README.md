@@ -65,8 +65,8 @@ The platform follows a **medallion architecture** (Bronze → Silver → Gold �
 | [Python](https://www.python.org/) | 3.11+ | Pipeline + inference code |
 | [uv](https://docs.astral.sh/uv/) | latest | Fast Python package manager |
 
-> [!NOTE]
-> Tested on a single-node Kind cluster with **~22 GiB RAM**. The full stack (incl. DataHub + KServe) is memory-hungry — deploy only what you need, and check `free -h` before heavy components.
+<!-- > [!NOTE]
+> Tested on a single-node Kind cluster with **~22 GiB RAM**. The full stack (incl. DataHub + KServe) is memory-hungry — deploy only what you need, and check `free -h` before heavy components. -->
 
 ---
 
