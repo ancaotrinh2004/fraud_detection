@@ -1,0 +1,52 @@
+# Debezium PostgreSQL source connector (Part B).
+#
+# Captures inserts on oltp.transaction_events from the Postgres WAL (pgoutput
+# logical decoding) and publishes them to Kafka topic `fraud.events.raw`.
+#
+# Transforms:
+#   - unwrap  : ExtractNewRecordState → emit just the row (after-image), not the
+#               full Debezium {before,after,op,...} envelope.
+#   - route   : rename topic `fraud.oltp.transaction_events` → `fraud.events.raw`
+#               so the existing topic + Spark consumer need no change.
+#
+# Deploy (after KafkaConnect is Ready and the OLTP publication exists):
+#   kubectl apply -f infra/k8s/kafka/debezium-connector.yaml
+#   kubectl get kafkaconnector fraud-oltp-connector -n fraud-infra -o yaml | grep -A5 conditions
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaConnector
+metadata:
+  name: fraud-oltp-connector
+  namespace: fraud-infra
+  labels:
+    strimzi.io/cluster: fraud-connect
+spec:
+  class: io.debezium.connector.postgresql.PostgresConnector
+  tasksMax: 1
+  config:
+    # ── Source database ──
+    database.hostname: fraud-postgres-postgresql.fraud-infra.svc.cluster.local
+    database.port: "5432"
+    database.user: fraud_user
+    database.password: fraud_pass
+    database.dbname: fraud_detection
+    plugin.name: pgoutput
+
+    # ── What to capture ──
+    topic.prefix: fraud
+    schema.include.list: oltp
+    table.include.list: oltp.transaction_events
+    snapshot.mode: initial
+
+    # ── Logical replication objects (created by init_oltp_schema.py / Debezium) ──
+    slot.name: debezium_fraud
+    publication.name: dbz_fraud_publication
+    publication.autocreate.mode: filtered
+
+    # ── Shape the message: flat row → topic fraud.events.raw ──
+    tombstones.on.delete: "false"
+    transforms: unwrap,route
+    transforms.unwrap.type: io.debezium.transforms.ExtractNewRecordState
+    transforms.unwrap.drop.tombstones: "true"
+    transforms.route.type: org.apache.kafka.connect.transforms.RegexRouter
+    transforms.route.regex: "fraud\\.oltp\\.transaction_events"
+    transforms.route.replacement: "fraud.events.raw"

@@ -24,9 +24,13 @@ def get_pg_connection_string(cfg: dict | None = None) -> str:
         cfg = load_pipeline_config()
     pg = cfg["postgres"]
     password = os.environ.get("POSTGRES_PASSWORD", pg["password"])
+    # Host/port overridable via env so scripts can run from a laptop over a
+    # port-forward (the config default is the in-cluster service DNS).
+    host = os.environ.get("POSTGRES_HOST", pg["host"])
+    port = os.environ.get("POSTGRES_PORT", pg["port"])
     return (
         f"postgresql://{pg['user']}:{password}"
-        f"@{pg['host']}:{pg['port']}/{pg['database']}"
+        f"@{host}:{port}/{pg['database']}"
     )
 
 

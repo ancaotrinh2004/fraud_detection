@@ -1,0 +1,4 @@
+# Minimal deps for the Spark Structured Streaming Bronze job.
+# PySpark itself ships in the apache/spark base image; the streaming job only
+# needs to read the YAML pipeline config (no DB/duckdb stack).
+pyyaml==6.0.2

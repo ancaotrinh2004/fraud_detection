@@ -228,6 +228,36 @@ class TestDerivedFeatures:
         assert captured["txn_amount_ratio"] == 0     # avg 0 → ratio 0
         assert captured["is_night_txn"] == 0
 
+    def _capture_features(self, model, instance: dict) -> dict:
+        captured = {}
+
+        def fake_score(artifact, features):
+            captured.update(features)
+            return {"fraud_score": 0.1, "model_version": "v"}
+
+        with patch.object(model, "_fetch_features", return_value=_zero_features()), \
+             patch.object(model._scoring, "score_online", side_effect=fake_score):
+            model.predict(_payload([instance]))
+        return captured
+
+    def test_is_declined_derived_from_status(self, model):
+        # server derives the flag from raw status (matches ml_label.py), not a client-sent flag
+        base = {"customer_id": "C1", "txn_amount": 100.0, "txn_hour": 10}
+        assert self._capture_features(model, {**base, "transaction_status": "declined"})["is_declined_txn"] == 1
+        assert self._capture_features(model, {**base, "status": "declined"})["is_declined_txn"] == 1
+        assert self._capture_features(model, {**base, "transaction_status": "approved"})["is_declined_txn"] == 0
+        assert self._capture_features(model, base)["is_declined_txn"] == 0   # omitted → 0
+
+    def test_is_foreign_derived_from_country_mismatch(self, model):
+        base = {"customer_id": "C1", "txn_amount": 100.0, "txn_hour": 10}
+        # ip_country != card_country (case-insensitive) → foreign
+        assert self._capture_features(model, {**base, "ip_country": "US", "card_country": "vn"})["is_foreign_txn"] == 1
+        # same country (case-insensitive) → not foreign
+        assert self._capture_features(model, {**base, "ip_country": "us", "card_country": "US"})["is_foreign_txn"] == 0
+        # either side missing → not foreign (matches the NOT NULL guard in training)
+        assert self._capture_features(model, {**base, "ip_country": "US"})["is_foreign_txn"] == 0
+        assert self._capture_features(model, base)["is_foreign_txn"] == 0
+
 
 # ── batch ──────────────────────────────────────────────────────────────────────
 

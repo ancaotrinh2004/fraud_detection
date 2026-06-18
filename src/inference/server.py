@@ -239,8 +239,22 @@ class FraudModel(kserve.Model):
 
         features["txn_amount"]      = txn_amount
         features["txn_hour"]        = txn_hour
-        features["is_declined_txn"] = int(txn.get("is_declined_txn", 0))
-        features["is_foreign_txn"]  = int(txn.get("is_foreign_txn", 0))
+
+        # Derive these flags server-side from raw event attributes so the logic
+        # matches the training definition exactly (ml_label.py) — the client sends
+        # the raw transaction, not pre-computed flags, removing a train/serve skew
+        # surface. Definitions must stay in sync with ml_label.py:
+        #   is_declined_txn = (status == 'declined')
+        #   is_foreign_txn  = ip_country and card_country present and differ (case-insensitive)
+        status       = str(txn.get("transaction_status", txn.get("status", ""))).lower()
+        ip_country   = txn.get("ip_country")
+        card_country = txn.get("card_country")
+        features["is_declined_txn"] = 1 if status == "declined" else 0
+        features["is_foreign_txn"]  = (
+            1 if ip_country and card_country
+                 and str(ip_country).lower() != str(card_country).lower()
+            else 0
+        )
 
         avg_90d = features.get("f_customer_avg_txn_amount_90d") or 0
         features["txn_amount_ratio"] = txn_amount / avg_90d if avg_90d > 0 else 0

@@ -65,21 +65,41 @@ The platform follows a **medallion architecture** (Bronze → Silver → Gold �
 | [Python](https://www.python.org/) | 3.11+ | Pipeline + inference code |
 | [uv](https://docs.astral.sh/uv/) | latest | Fast Python package manager |
 
-<!-- > [!NOTE]
-> Tested on a single-node Kind cluster with **~22 GiB RAM**. The full stack (incl. DataHub + KServe) is memory-hungry — deploy only what you need, and check `free -h` before heavy components. -->
+> [!NOTE]
+> Tested on a single-node Kind cluster with **~22 GiB RAM**. The full stack (incl. DataHub + KServe) is memory-hungry — deploy only what you need, and check `free -h` before heavy components.
 
 ---
 
 ## 🚀 Quick Start
 
 This walks through a full, from-scratch setup in **best-practice dependency order**. Each component links to its detailed guide in [`docs/`](docs/) — follow them in order.
-
-### 1. Cluster, Helm repos & namespaces
-
+### 1. Set up cluster 
+#### 1.1 Using GKE 
+**Login gcp:**
+```bash
+gcloud auth application default login
+```
+Then enable Kubernets Engine API
+![Kubernets Engine API](./docs/assets/kubernetes_engine_api.png)
+**Provision**
+```bash
+cd IaC
+terraform init
+terraform plan
+terraform apply
+```
+**Connect to GKE**
+![alt text](./docs/assets/image.png)
+![alt text](./docs/assets/image-1.png)
+![alt text](./docs/assets/image-2.png)
+#### 1.2 Using Kind Cluster
 ```bash
 kind create cluster --name fraud-detection
 kubectl config current-context        # → kind-fraud-detection
+```
+### 2. Helm repos & namespaces
 
+```bash
 helm repo add apache-airflow https://airflow.apache.org
 helm repo add bitnami https://charts.bitnami.com/bitnami
 helm repo add minio https://charts.min.io/
@@ -94,7 +114,7 @@ helm repo update
 for ns in fraud-infra airflow monitoring datahub jenkins; do kubectl create namespace $ns; done
 ```
 
-### 2. Generate the dataset (local)
+### 3. Generate the dataset (local)
 
 ```bash
 python src/generator/generate_data.py --config configs/generate_config.yaml
@@ -102,70 +122,71 @@ python src/generator/generate_data.py --config configs/generate_config.yaml
 
 Produces `data/raw/offline/` (Parquet) + `data/raw/streaming/fraud_events.json` — 120k customers · ~1.44M transactions · 180 days · 10% fraud · amount-drift scenario from 2025-08-01.
 
-### 3. Core infra — PostgreSQL · MinIO · Airflow
+### 4. Core infra — PostgreSQL · MinIO · Airflow
 
 > 📄 **[docs/airflow.md](docs/airflow.md)** — deploy Postgres + MinIO, build & push the Airflow image, upload raw data to MinIO, init the Gold schema, install Airflow, and load the 14 DAGs.
 
-### 4. MLflow — experiment tracking & model registry
+### 5. MLflow — experiment tracking & model registry
 
 > 📄 **[docs/mlflow.md](docs/mlflow.md)** — MLflow server with a SQLite backend + MinIO artifact store; replaces the legacy Postgres registry table.
 
-### 5. Kafka — streaming source
+### 6. Streaming — Kafka · CDC · Spark
 
-> 📄 **[docs/kafka.md](docs/kafka.md)** — Strimzi operator + KRaft Kafka + topic `fraud.events.raw` feeding the streaming Bronze pipeline.
+> 📄 **[docs/streaming-cdc.md](docs/streaming-cdc.md)** — the full streaming track in one guide: Strimzi/KRaft Kafka + topic `fraud.events.raw`, then Postgres OLTP → Debezium CDC → Kafka → Spark Structured Streaming → Delta Bronze (replaces the legacy micro-batch consumer).
 
-### 6. Observability — Prometheus · Grafana · Loki · Jaeger
+### 7. Observability — Prometheus · Grafana · Loki · Jaeger
 
 > 📄 **[docs/observability.md](docs/observability.md)** — the full metrics + logs + traces stack: kube-prometheus-stack + Pushgateway + Grafana dashboard + drift alerts → Discord, Loki/Promtail logs (LogQL), and Jaeger tracing (`fetch_features` vs `score_model`).
 
-### 7. Governance — contracts & lineage
+### 8. Governance — contracts & lineage
 
 > 📄 **[docs/governance.md](docs/governance.md)** — Great Expectations data contracts + Data Docs (Gold quality gate) and DataHub for auto-emitted Bronze→Silver→Gold→Feature lineage.
 
-### 8. Online inference — KServe
+### 9. Online inference — KServe
 
 > 📄 **[docs/kserve.md](docs/kserve.md)** — cert-manager / Istio / Knative / KServe, build & deploy the `FraudModel` InferenceService (V2 protocol).
 
-### 9. CI/CD — Jenkins
+### 10. CI/CD — Jenkins
 
 > 📄 **[docs/jenkins.md](docs/jenkins.md)** — Jenkins on-cluster with 3 multibranch pipelines (data/ML, inference, IaC).
 
-### 10. Run the pipelines & validate
-
+### 11. Upload raw data offline to Minio 
 ```bash
-kubectl port-forward svc/airflow-api-server 8080:8080 -n airflow   # http://localhost:8080 (admin / admin123)
+uv run scripts/setup/upload_raw_to_minio.py
 ```
-
-Trigger DAGs in dependency order:
-
-```
-batch_bronze → batch_silver → batch_gold
-                                  │
-                  ┌───────────────┴───────────────┐
-            batch_features                  stream_features
-                  └───────────────┬───────────────┘
-                            feat_unified → ml_label → ml_train → ml_batch_score
-```
-
-`drift_monitor`, `ml_retrain_trigger`, and `feat_backfill` run on their own schedules. Then test the live model:
-
+![alt text](/docs/assets/image-3.png)
+![alt text](/docs/assets/image-4.png)
+### 12. Streaming data
+The generator writes events into OLTP; Debezium streams them out. Run it from a laptop over the same port-forward (`POSTGRES_HOST`/`POSTGRES_PORT` overrides):
 ```bash
-kubectl port-forward -n fraud-infra \
-  $(kubectl get pod -n fraud-infra -l serving.knative.dev/service=fraud-predictor -o name | head -1) 8080:8080
-python scripts/validate/test_inference.py --host localhost --port 8080
+kubectl port-forward svc/fraud-postgres-postgresql -n fraud-infra 15432:5432 &
+POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=15432 \
+  uv run -m src.generator.streaming.oltp_writer replay \
+  --source data/raw/streaming/fraud_events.json --speed 3600 --max-events 200000
 ```
+**Database streaming event:**
+![alt](./docs/assets/data_streaming.png) 
+**Logs Spark Job:**
+![atl](./docs/assets/logs_spark_job.png)
+**Check the data stream:**
 
+Port-forward `kafka ui` and access a `localhost:8080`:
+![atl](./docs/assets/message_kafka.png)
+### 13. Test Inference
+```bash
+uv run scripts/validate/test_inference.py
+```
 ### Component Setup Guides
 
 | # | Component | Namespace | Guide |
 |---|---|---|---|
-| 3 | PostgreSQL · MinIO · Airflow | `fraud-infra`, `airflow` | [airflow.md](docs/airflow.md) |
-| 4 | MLflow | `fraud-infra` | [mlflow.md](docs/mlflow.md) |
-| 5 | Kafka (Strimzi) | `fraud-infra` | [kafka.md](docs/kafka.md) |
-| 6 | Observability — Prometheus · Grafana · Loki · Jaeger | `monitoring`, `fraud-infra` | [observability.md](docs/observability.md) |
-| 7 | Governance — Great Expectations · DataHub | `datahub` | [governance.md](docs/governance.md) |
-| 8 | KServe Inference | `fraud-infra` | [kserve.md](docs/kserve.md) |
-| 9 | Jenkins CI/CD | `jenkins` | [jenkins.md](docs/jenkins.md) |
+| 4 | PostgreSQL · MinIO · Airflow | `fraud-infra`, `airflow` | [airflow.md](docs/airflow.md) |
+| 5 | MLflow | `fraud-infra` | [mlflow.md](docs/mlflow.md) |
+| 6 | Streaming — Kafka · CDC · Spark | `fraud-infra` | [streaming-cdc.md](docs/streaming-cdc.md) |
+| 7 | Observability — Prometheus · Grafana · Loki · Jaeger | `monitoring`, `fraud-infra` | [observability.md](docs/observability.md) |
+| 8 | Governance — Great Expectations · DataHub | `datahub` | [governance.md](docs/governance.md) |
+| 9 | KServe Inference | `fraud-infra` | [kserve.md](docs/kserve.md) |
+| 10 | Jenkins CI/CD | `jenkins` | [jenkins.md](docs/jenkins.md) |
 
 ---
 

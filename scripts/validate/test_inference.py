@@ -40,8 +40,11 @@ TEST_CASES = [
                 "customer_id": "C0000019",
                 "txn_amount": 9999.0,
                 "txn_hour": 2,
-                "is_declined_txn": 1,
-                "is_foreign_txn": 1,
+                # raw event attributes — the server derives is_declined_txn /
+                # is_foreign_txn from these (matches the training definition).
+                "transaction_status": "declined",
+                "ip_country": "US",
+                "card_country": "VN",
             }
         ],
     },
@@ -55,7 +58,8 @@ TEST_CASES = [
         "name": "Batch — 3 customers",
         "instances": [
             {"customer_id": "C0000019", "txn_amount": 50.0,   "txn_hour": 10},
-            {"customer_id": "C0000020", "txn_amount": 5000.0, "txn_hour": 3, "is_foreign_txn": 1},
+            {"customer_id": "C0000020", "txn_amount": 5000.0, "txn_hour": 3,
+             "ip_country": "US", "card_country": "VN"},      # foreign (derived server-side)
             {"customer_id": "C0000021", "txn_amount": 200.0,  "txn_hour": 18},
         ],
     },

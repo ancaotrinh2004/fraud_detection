@@ -143,12 +143,13 @@ ClusterRole là bắt buộc vì pipeline cần tương tác cross-namespace và
 | core (`""`) | pods, pods/exec, pods/portforward, pods/log | Track A (exec), Track B (port-forward) |
 | core (`""`) | configmaps, secrets | Track A (DAG ConfigMap), Track C (secrets) |
 | core (`""`) | namespaces, services, serviceaccounts | Track C (tạo namespace) |
-| `apps` | deployments, statefulsets, replicasets | Track A (rollout restart) |
+| `apps` | deployments, statefulsets, replicasets | Track A (rollout restart + `set image` fraud-spark-bronze) |
 | `batch` | jobs, cronjobs | Airflow task execution |
 | `rbac.authorization.k8s.io` | roles, rolebindings, clusterroles | Helm charts tạo RBAC |
 | `serving.kserve.io` | inferenceservices | Track B (patch/apply ISVC) |
 | `monitoring.coreos.com` | servicemonitors, prometheusrules | Track C (ServiceMonitor) |
 | `networking.knative.dev` | ingresses | Track C (net-istio.yaml) |
+| `kafka.strimzi.io` | kafkas, kafkaconnects, kafkaconnectors, kafkatopics | Track C (apply Kafka cluster + Debezium connector) |
 | `apiextensions.k8s.io` | customresourcedefinitions | Helm upgrade kiểm tra CRDs |
 
 ---
@@ -193,7 +194,8 @@ Mỗi stage chỉ chạy khi đúng file thay đổi:
 | `infra/docker/airflow/**` | Build image + Push + Helm upgrade Airflow |
 | `infra/helm/airflow/**` | Helm upgrade only (no image rebuild) |
 | `dags/**` | Lint + DAG validation + Update ConfigMap + Restart dag-processor |
-| `config/pipeline_config.yaml` | Update fraud-pipeline-config ConfigMap + Restart workers |
+| `configs/pipeline_config.yaml` | Update fraud-pipeline-config ConfigMap + Restart workers **+ rebuild Spark image** (config is baked in) |
+| `src/pipelines/streaming/**`, `infra/docker/spark/**` | Build + Push Spark image + `set image` roll `fraud-spark-bronze` Deployment |
 
 ### Track B — Inference Service
 
@@ -215,6 +217,9 @@ Mỗi stage chỉ chạy khi đúng file thay đổi:
 | `infra/k8s/pushgateway.yaml` | `kubectl apply` + rollout status |
 | `infra/k8s/fraud-inference-monitor.yaml` | `kubectl apply` ServiceMonitor |
 | `infra/k8s/net-istio.yaml` | `kubectl apply` Istio/Knative config |
+| `infra/docker/kafka-connect/**` | Build + Push Kafka Connect (Debezium) image + roll Connect pod |
+| `infra/k8s/kafka/**` | `kubectl apply` Kafka cluster + topic + Connect + Debezium connector |
+| `infra/k8s/spark-streaming.yaml` | `kubectl apply` fraud-spark-bronze Deployment |
 
 ---
 

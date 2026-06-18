@@ -222,7 +222,7 @@ batch_bronze → batch_silver → batch_gold
 
 ---
 
-<!-- ## 🛠️ Ghi chú kỹ thuật
+## 🛠️ Ghi chú kỹ thuật
 
 <details>
 <summary><b>Tại sao mount DAGs qua subPath?</b></summary>
@@ -240,4 +240,4 @@ ConfigMap giới hạn 1 MB và không hỗ trợ thư mục lồng nhau. Bake v
 <summary><b>Tại sao cần <code>PYTHONPATH=/opt/airflow</code>?</b></summary>
 
 Task runner chạy ở `/opt/airflow`; không có `PYTHONPATH`, Python không thấy package `src` → `ModuleNotFoundError`. Set trong `values.yaml` (`env:`).
-</details> -->
+</details>

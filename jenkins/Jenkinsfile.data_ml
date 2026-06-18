@@ -5,6 +5,9 @@
 //   dags/**                                      → update airflow-dags ConfigMap + restart dag-processor/worker/scheduler
 //   configs/pipeline_config.yaml                 → update fraud-pipeline-config ConfigMap + restart workers
 //   infra/helm/airflow/**                        → helm upgrade only (no image rebuild)
+//   src/pipelines/streaming/**, infra/docker/spark/**, configs/pipeline_config.yaml
+//                                                → rebuild + push Spark image → roll the fraud-spark-bronze Deployment
+//                                                  (the streaming Bronze engine bakes src/ + config into the image)
 //
 // Manual trigger:
 //   - Trigger on main with no code change → all CD stages run automatically (empty changeset detected)
@@ -62,12 +65,14 @@ spec:
     }
 
     environment {
-        PYTHONPATH   = "${WORKSPACE}"
-        PIP_QUIET    = "1"
-        IMAGE_REPO   = "ancaotrinh/fraud-airflow"
-        AIRFLOW_NS   = "airflow"
-        HELM_RELEASE = "airflow"
-        HELM_VERSION = "1.21.0"
+        PYTHONPATH       = "${WORKSPACE}"
+        PIP_QUIET        = "1"
+        IMAGE_REPO       = "ancaotrinh/fraud-airflow"
+        SPARK_IMAGE_REPO = "ancaotrinh/fraud-spark"
+        AIRFLOW_NS       = "airflow"
+        FRAUD_NS         = "fraud-infra"
+        HELM_RELEASE     = "airflow"
+        HELM_VERSION     = "1.21.0"
     }
 
     stages {
@@ -392,6 +397,70 @@ PYEOF
                 """
             }
         }
+
+        // ── CD — Spark streaming Bronze engine ────────────────────────────────────
+        // The continuous Spark Structured Streaming job runs OUTSIDE Airflow as the
+        // fraud-spark-bronze Deployment. Its image bakes src/ + configs, so it must
+        // rebuild when the streaming code, its Dockerfile, or the pipeline config changes.
+        stage('Build & Push Spark Image') {
+            when {
+                allOf {
+                    branch 'main'
+                    anyOf {
+                        changeset "src/pipelines/streaming/**"
+                        changeset "infra/docker/spark/**"
+                        changeset "configs/pipeline_config.yaml"
+                        expression { env.RUN_DEPLOY == 'true' }
+                    }
+                }
+            }
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'dockerhub-token',
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
+                    sh """
+                        docker build --no-cache \\
+                            -f infra/docker/spark/Dockerfile \\
+                            -t ${env.SPARK_IMAGE_REPO}:${env.SHORT_COMMIT} \\
+                            -t ${env.SPARK_IMAGE_REPO}:latest \\
+                            .
+
+                        echo "${DOCKER_PASS}" | docker login -u "${DOCKER_USER}" --password-stdin
+                        docker push ${env.SPARK_IMAGE_REPO}:${env.SHORT_COMMIT}
+                        docker push ${env.SPARK_IMAGE_REPO}:latest
+                        docker logout
+                    """
+                }
+            }
+        }
+
+        stage('Deploy Spark Streaming Job') {
+            when {
+                allOf {
+                    branch 'main'
+                    anyOf {
+                        changeset "src/pipelines/streaming/**"
+                        changeset "infra/docker/spark/**"
+                        changeset "configs/pipeline_config.yaml"
+                        expression { env.RUN_DEPLOY == 'true' }
+                    }
+                }
+            }
+            steps {
+                sh """
+                    # Pin to the immutable commit tag (replicas:1 + Recreate strategy
+                    # means the old driver is torn down before the new one claims the
+                    # checkpoint → exactly-once is preserved across the rollout).
+                    kubectl set image deployment/fraud-spark-bronze \\
+                        spark-bronze=${env.SPARK_IMAGE_REPO}:${env.SHORT_COMMIT} \\
+                        -n ${env.FRAUD_NS}
+                    kubectl rollout status deployment/fraud-spark-bronze \\
+                        -n ${env.FRAUD_NS} --timeout=5m
+                """
+            }
+        }
     }
 
     post {
@@ -418,6 +487,7 @@ PYEOF
             sh '''
                 rm -rf .ci-venv test-results-*.xml coverage-*.xml || true
                 docker rmi "${IMAGE_REPO}:${SHORT_COMMIT}" "${IMAGE_REPO}:latest" 2>/dev/null || true
+                docker rmi "${SPARK_IMAGE_REPO}:${SHORT_COMMIT}" "${SPARK_IMAGE_REPO}:latest" 2>/dev/null || true
             '''
         }
     }

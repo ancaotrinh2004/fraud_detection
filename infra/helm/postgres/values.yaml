@@ -1,0 +1,34 @@
+# bitnami/postgresql values — adds logical replication for Debezium CDC (Part B).
+#
+# Re-deploy (or upgrade) Postgres with these values so the WAL can be decoded by
+# Debezium. Without wal_level=logical the connector fails at startup.
+#
+#   helm upgrade --install fraud-postgres bitnami/postgresql \
+#     --namespace fraud-infra -f infra/helm/postgres/values.yaml
+#
+# NOTE: changing wal_level requires a Postgres restart. On an existing install,
+# `helm upgrade` + pod restart applies it.
+
+auth:
+  username: fraud_user
+  password: fraud_pass
+  database: fraud_detection
+  postgresPassword: fraud_pass        # known superuser password (was random before)
+
+primary:
+  persistence:
+    size: 5Gi
+
+  # Logical decoding for CDC. pgoutput is built into Postgres (no plugin install).
+  extendedConfiguration: |
+    wal_level = logical
+    max_wal_senders = 10
+    max_replication_slots = 10
+
+  # Grant the app user REPLICATION so Debezium can open a replication slot as
+  # fraud_user (it already owns the database + oltp tables → can create the
+  # filtered publication itself).
+  initdb:
+    scripts:
+      01_enable_cdc.sql: |
+        ALTER ROLE fraud_user WITH REPLICATION;

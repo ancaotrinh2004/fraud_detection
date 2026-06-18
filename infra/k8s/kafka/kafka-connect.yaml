@@ -1,0 +1,45 @@
+# Strimzi Kafka Connect cluster running the pre-built Debezium image (Part B).
+#
+# The image (Debezium Postgres plugin baked in) is built + pushed manually —
+# see infra/docker/kafka-connect/Dockerfile — so there is no in-cluster build
+# and no push secret. The base tag must match the running Strimzi operator.
+#
+# Deploy:
+#   docker build -f infra/docker/kafka-connect/Dockerfile -t ancaotrinh/fraud-kafka-connect:latest .
+#   docker push ancaotrinh/fraud-kafka-connect:latest
+#   kubectl apply -f infra/k8s/kafka/kafka-connect.yaml
+#   kubectl wait --for=condition=Ready kafkaconnect/fraud-connect -n fraud-infra --timeout=600s
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaConnect
+metadata:
+  name: fraud-connect
+  namespace: fraud-infra
+  annotations:
+    strimzi.io/use-connector-resources: "true"   # manage connectors via KafkaConnector CRs
+spec:
+  version: 4.1.0
+  replicas: 1
+  image: ancaotrinh/fraud-kafka-connect:latest    # pre-built (Debezium baked in)
+  bootstrapServers: fraud-kafka-kafka-bootstrap.fraud-infra.svc.cluster.local:9092
+  # v1 API: groupId + *StorageTopic are dedicated spec fields (not config keys).
+  groupId: fraud-connect-cluster
+  offsetStorageTopic: fraud-connect-cluster-offsets
+  configStorageTopic: fraud-connect-cluster-configs
+  statusStorageTopic: fraud-connect-cluster-status
+  config:
+    config.storage.replication.factor: 1
+    offset.storage.replication.factor: 1
+    status.storage.replication.factor: 1
+    # Emit flat JSON values (no Connect envelope schema) so the Debezium-unwrapped
+    # message is a plain event row identical in shape to the legacy file-replay event.
+    key.converter: org.apache.kafka.connect.json.JsonConverter
+    value.converter: org.apache.kafka.connect.json.JsonConverter
+    key.converter.schemas.enable: false
+    value.converter.schemas.enable: false
+  resources:
+    requests:
+      memory: 768Mi
+      cpu: 250m
+    limits:
+      memory: 1Gi
+      cpu: "1"

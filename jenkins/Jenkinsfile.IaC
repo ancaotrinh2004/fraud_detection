@@ -12,6 +12,9 @@
 //   infra/k8s/grafana-fraud-dashboard.yaml     → kubectl apply Grafana dashboard ConfigMap
 //   infra/k8s/fraud-inference.yaml             → kubectl apply InferenceService spec
 //   infra/k8s/net-istio.yaml                   → kubectl apply Istio/Knative config
+//   infra/docker/kafka-connect/**              → rebuild + push Kafka Connect (Debezium) image
+//   infra/k8s/kafka/**                         → kubectl apply Kafka cluster + topic + Connect + Debezium connector
+//   infra/k8s/spark-streaming.yaml             → kubectl apply the fraud-spark-bronze Deployment
 //
 // Manual trigger:
 //   - Trigger on main with no code change → all CD stages run automatically (empty changeset detected)
@@ -73,6 +76,8 @@ spec:
         FRAUD_NS      = "fraud-infra"
         AIRFLOW_NS    = "airflow"
         DATAHUB_NS    = "datahub"
+
+        KAFKA_CONNECT_IMAGE = "ancaotrinh/fraud-kafka-connect"
 
         // Pinned Helm chart versions (per docs)
         MONITORING_CHART_VER  = "85.2.0"
@@ -198,6 +203,11 @@ spec:
                         infra/k8s/grafana-fraud-dashboard.yaml
                         infra/k8s/fraud-inference.yaml
                         infra/k8s/net-istio.yaml
+                        infra/k8s/kafka/kafka.yaml
+                        infra/k8s/kafka/kafka-topics.yaml
+                        infra/k8s/kafka/kafka-connect.yaml
+                        infra/k8s/kafka/debezium-connector.yaml
+                        infra/k8s/spark-streaming.yaml
                     "
                     FAILED=0
                     for f in \$MANIFESTS; do
@@ -320,6 +330,82 @@ PYEOF
 
                     kubectl get pods -n knative-serving \\
                         -l app=net-istio-controller 2>/dev/null || true
+                """
+            }
+        }
+
+        // ── CD — Kafka Connect (Debezium) image ───────────────────────────────────
+        // Pure-infra image: Strimzi base + Debezium plugin (no src/ code). Rebuild
+        // only when its Dockerfile changes, then roll the Connect pod to re-pull.
+        stage('Build & Push Kafka Connect Image') {
+            when {
+                allOf {
+                    branch 'main'
+                    anyOf {
+                        changeset "infra/docker/kafka-connect/**"
+                        expression { env.RUN_DEPLOY == 'true' }
+                    }
+                }
+            }
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'dockerhub-token',
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
+                    sh """
+                        docker build --no-cache \\
+                            -f infra/docker/kafka-connect/Dockerfile \\
+                            -t ${env.KAFKA_CONNECT_IMAGE}:latest \\
+                            .
+
+                        echo "${DOCKER_PASS}" | docker login -u "${DOCKER_USER}" --password-stdin
+                        docker push ${env.KAFKA_CONNECT_IMAGE}:latest
+                        docker logout
+
+                        # Force the running Connect pod (if any) to re-pull :latest.
+                        kubectl delete pod -n ${env.FRAUD_NS} \\
+                            -l strimzi.io/cluster=fraud-connect --ignore-not-found
+                    """
+                }
+            }
+        }
+
+        // ── CD — Kafka cluster + CDC + Spark streaming manifests ───────────────────
+        // Assumes the Strimzi operator is already installed (bootstrap, see
+        // docs/streaming-cdc.md). Applies the Kafka cluster, topic, Connect, the
+        // Debezium connector, and the Spark streaming Deployment in dependency order.
+        stage('Apply Kafka + Streaming Manifests') {
+            when {
+                allOf {
+                    branch 'main'
+                    anyOf {
+                        changeset "infra/k8s/kafka/**"
+                        changeset "infra/k8s/spark-streaming.yaml"
+                        expression { env.RUN_DEPLOY == 'true' }
+                    }
+                }
+            }
+            steps {
+                sh """
+                    kubectl apply -f infra/k8s/kafka/kafka.yaml
+                    kubectl wait kafka/fraud-kafka -n ${env.FRAUD_NS} \\
+                        --for=condition=Ready --timeout=5m
+
+                    kubectl apply -f infra/k8s/kafka/kafka-topics.yaml
+
+                    kubectl apply -f infra/k8s/kafka/kafka-connect.yaml
+                    kubectl wait --for=condition=Ready kafkaconnect/fraud-connect \\
+                        -n ${env.FRAUD_NS} --timeout=10m
+
+                    kubectl apply -f infra/k8s/kafka/debezium-connector.yaml
+                    kubectl get kafkaconnector fraud-oltp-connector -n ${env.FRAUD_NS} || true
+
+                    # Spark streaming Deployment (image is rolled by Track A; this only
+                    # reconciles the manifest spec — env, resources, replicas, etc.)
+                    kubectl apply -f infra/k8s/spark-streaming.yaml
+                    kubectl rollout status deployment/fraud-spark-bronze \\
+                        -n ${env.FRAUD_NS} --timeout=5m
                 """
             }
         }

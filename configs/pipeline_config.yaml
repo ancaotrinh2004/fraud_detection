@@ -49,7 +49,31 @@ kafka:
   topic_fraud_events: "fraud.events.raw"
   consumer_group: "bronze-ingest-events"
   poll_timeout_ms: 30000            # how long Bronze consumer polls per Airflow trigger
-  batch_size: 1000                  # messages per poll batch
+  batch_size: 1000                  # messages per poll batch (legacy micro-batch consumer)
+
+# ── OLTP source (CDC origin — Part B) ─────────────────────
+# The generator writes events here; Debezium captures the WAL → Kafka.
+oltp:
+  schema: "oltp"
+  table: "transaction_events"
+  batch_size: 1000                  # rows per INSERT batch from the generator
+
+# ── Debezium CDC ──────────────────────────────────────────
+debezium:
+  connector_name: "fraud-oltp-connector"
+  publication_name: "dbz_fraud_publication"
+  slot_name: "debezium_fraud"
+
+# ── Spark Structured Streaming → Bronze (Part A) ──────────
+# Continuous engine that replaces the 5-min micro-batch Bronze consumer.
+# Uses s3a:// (Spark's S3 scheme) over the same MinIO buckets delta-rs uses.
+spark_streaming:
+  kafka_topic: "fraud.events.raw"
+  bronze_table: "s3a://bronze/raw_fraud_events"
+  checkpoint_location: "s3a://bronze/_checkpoints/raw_fraud_events"
+  starting_offsets: "earliest"
+  max_offsets_per_trigger: 50000    # backpressure cap per micro-batch trigger
+  trigger_interval: "30 seconds"    # latency ↔ small-file tradeoff
 
 # ── MLflow model registry ─────────────────────────────────
 mlflow:

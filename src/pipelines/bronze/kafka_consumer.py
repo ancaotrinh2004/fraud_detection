@@ -1,11 +1,15 @@
 """
 src/pipelines/bronze/kafka_consumer.py
 
-Kafka consumer for fraud.events.raw → Delta Lake Bronze (raw_fraud_events).
-Called by ingest_events.py when kafka.enabled=true in pipeline_config.yaml.
+⚠ LEGACY — replaced by the continuous Spark Structured Streaming engine
+(`src/pipelines/streaming/spark_bronze.py`, deployed as fraud-spark-bronze) in
+the CDC + Spark architecture (Parts A+B). Kept for reference / fallback only;
+no longer wired into the `stream_bronze` DAG.
 
-Pattern: micro-batch — triggered every 5 min by Airflow, polls for up to
-`poll_timeout_ms` milliseconds, writes all received messages to Bronze.
+Kafka consumer for fraud.events.raw → Delta Lake Bronze (raw_fraud_events).
+
+Pattern: micro-batch — was triggered every 5 min by Airflow, polled for up to
+`poll_timeout_ms` milliseconds, wrote all received messages to Bronze.
 """
 
 import json
