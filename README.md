@@ -248,4 +248,5 @@ jenkins/        # Jenkinsfile.track_a / _b / _c
 scripts/        # setup/ (cluster bootstrap) · validate/ · governance/
 src/            # generator/ · inference/ (KServe) · pipelines/ (bronze→ml)
 tests/          # unit/ · integration/  (262 tests)
+IaC/            # Provision GKE
 ```
