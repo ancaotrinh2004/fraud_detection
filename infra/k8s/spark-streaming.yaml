@@ -1,0 +1,43 @@
+# Spark Structured Streaming — continuous Bronze ingestion (Part A).
+#
+# Runs the streaming driver in local[*] mode as a single long-running pod
+# (light enough for a single-node Kind cluster — no Spark cluster/operator).
+# Replaces the legacy 5-minute micro-batch `stream_bronze` Airflow task.
+#
+# Deploy:
+#   kubectl apply -f infra/k8s/fraud-pipeline-secret.yaml      # MinIO creds
+#   kubectl apply -f infra/k8s/spark-streaming.yaml
+#   kubectl logs -n fraud-infra deploy/fraud-spark-bronze -f
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fraud-spark-bronze
+  namespace: fraud-infra
+  labels:
+    app: fraud-spark-bronze
+spec:
+  replicas: 1                 # exactly one — the checkpoint owns the Kafka offsets
+  strategy:
+    type: Recreate            # never run two drivers against the same checkpoint
+  selector:
+    matchLabels:
+      app: fraud-spark-bronze
+  template:
+    metadata:
+      labels:
+        app: fraud-spark-bronze
+    spec:
+      containers:
+        - name: spark-bronze
+          image: ancaotrinh/fraud-spark:latest
+          imagePullPolicy: Always
+          envFrom:
+            - secretRef:
+                name: fraud-pipeline-secret    # MINIO_ACCESS_KEY / MINIO_SECRET_KEY
+          resources:
+            requests:
+              memory: 2Gi
+              cpu: 500m
+            limits:
+              memory: 3Gi
+              cpu: "2"

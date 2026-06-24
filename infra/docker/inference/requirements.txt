@@ -1,0 +1,27 @@
+# KServe SDK (replaces FastAPI)
+kserve>=0.13.0
+
+# MLflow model loading
+mlflow>=2.15.0
+
+# Model + data
+xgboost==2.1.4
+scikit-learn==1.6.1
+pandas>=2.0
+numpy>=1.26
+
+# Database
+psycopg2-binary>=2.9
+sqlalchemy>=2.0
+
+# S3/MinIO access for MLflow artifact download
+boto3
+s3fs
+
+# Config + utils
+pyyaml>=6.0
+requests>=2.31
+
+# OpenTelemetry tracing → Jaeger
+opentelemetry-sdk>=1.25.0
+opentelemetry-exporter-otlp-proto-grpc>=1.25.0

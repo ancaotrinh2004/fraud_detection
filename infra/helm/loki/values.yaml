@@ -1,0 +1,107 @@
+# infra/helm/loki/values.yaml
+# Deploy with: helm install loki grafana/loki-stack -n monitoring -f values.yaml
+# Add repo:    helm repo add grafana https://grafana.github.io/helm-charts
+#
+# loki-stack includes Loki + Promtail (Grafana excluded — already deployed)
+
+loki:
+  enabled: true
+  image:
+    tag: "2.9.3"
+  persistence:
+    enabled: true
+    size: 10Gi
+  config:
+    schema_config:
+      configs:
+        - from: "2024-01-01"
+          store: boltdb-shipper
+          object_store: filesystem
+          schema: v11
+          index:
+            prefix: loki_
+            period: 24h
+    storage_config:
+      boltdb_shipper:
+        active_index_directory: /data/loki/index
+        cache_location: /data/loki/cache
+      filesystem:
+        directory: /data/loki/chunks
+    limits_config:
+      retention_period: 168h   # 7 days
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+promtail:
+  enabled: true
+  config:
+    snippets:
+      pipelineStages:
+        - json:
+            expressions:
+              level: level
+              request_id: request_id
+              customer_id: customer_id
+              fraud_score: fraud_score
+              latency_ms: latency_ms
+        - labels:
+            level:
+            request_id:
+      scrapeConfigs: |
+        - job_name: fraud-inference
+          kubernetes_sd_configs:
+            - role: pod
+              namespaces:
+                names: [fraud-infra]
+          relabel_configs:
+            # Knative appends the revision to the `app` label (e.g.
+            # fraud-predictor-00001), so match the prefix, not an exact string.
+            - source_labels: [__meta_kubernetes_pod_label_app]
+              action: keep
+              regex: fraud-predictor.*
+            - source_labels: [__meta_kubernetes_pod_uid, __meta_kubernetes_pod_container_name]
+              target_label: __path__
+              separator: /
+              regex: (.+)/(.+)
+              replacement: /var/log/pods/*$1*/$2/*.log
+            - source_labels: [__meta_kubernetes_namespace]
+              target_label: namespace
+            - source_labels: [__meta_kubernetes_pod_name]
+              target_label: pod
+            - source_labels: [__meta_kubernetes_pod_container_name]
+              target_label: container
+        - job_name: airflow-pipelines
+          kubernetes_sd_configs:
+            - role: pod
+              namespaces:
+                names: [airflow]
+          relabel_configs:
+            - source_labels: [__meta_kubernetes_pod_label_component]
+              action: keep
+              regex: worker|scheduler
+            - source_labels: [__meta_kubernetes_pod_uid, __meta_kubernetes_pod_container_name]
+              target_label: __path__
+              separator: /
+              regex: (.+)/(.+)
+              replacement: /var/log/pods/*$1*/$2/*.log
+            - source_labels: [__meta_kubernetes_namespace]
+              target_label: namespace
+            - source_labels: [__meta_kubernetes_pod_name]
+              target_label: pod
+            - source_labels: [__meta_kubernetes_pod_container_name]
+              target_label: container
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+grafana:
+  enabled: false   # already deployed separately

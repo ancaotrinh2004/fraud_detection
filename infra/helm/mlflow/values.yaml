@@ -1,0 +1,55 @@
+# infra/helm/mlflow/values.yaml
+# Deploy with: helm install mlflow community-charts/mlflow -n fraud-infra -f values.yaml
+# Add repo:    helm repo add community-charts https://community-charts.github.io/helm-charts
+
+image:
+  repository: ghcr.io/mlflow/mlflow
+  tag: v3.1.4
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 5000
+
+# Backend store: SQLite file on a PVC (no psycopg2 required)
+backendStore:
+  databaseMigration: false
+  databaseConnectionCheck: false
+  defaultSqlitePath: "/mlflow/data/mlflow.db"
+
+  postgres:
+    enabled: false
+
+# Artifact store: MinIO bucket mlflow-artifacts
+artifactRoot:
+  s3:
+    enabled: true
+    bucket: mlflow-artifacts
+    awsAccessKeyId: fraud_minio_user
+    awsSecretAccessKey: fraud_minio_pass
+
+extraEnvVars:
+  MLFLOW_S3_ENDPOINT_URL: "http://fraud-minio.fraud-infra.svc.cluster.local:9000"
+  AWS_DEFAULT_REGION: us-east-1
+  AWS_ACCESS_KEY_ID: fraud_minio_user
+  AWS_SECRET_ACCESS_KEY: fraud_minio_pass
+
+# Mount PVC for SQLite persistence
+extraVolumes:
+  - name: mlflow-sqlite
+    persistentVolumeClaim:
+      claimName: mlflow-sqlite-pvc
+
+extraVolumeMounts:
+  - name: mlflow-sqlite
+    mountPath: /mlflow/data
+
+resources:
+  requests:
+    cpu: 200m
+    memory: 512Mi
+  limits:
+    cpu: 1000m
+    memory: 1Gi
+
+replicaCount: 1

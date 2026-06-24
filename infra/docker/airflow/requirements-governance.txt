@@ -1,0 +1,5 @@
+# Data governance — installed as a separate layer for Docker cache efficiency.
+# Keep these in a separate file so that changes here do not invalidate the
+# heavier ML/lakehouse layer (requirements.txt) during rebuilds.
+acryl-datahub
+acryl-datahub-airflow-plugin

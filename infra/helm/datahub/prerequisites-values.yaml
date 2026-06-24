@@ -1,0 +1,65 @@
+# DataHub prerequisites for kind-fraud-detection (resource-constrained)
+# Uses OpenSearch (default) — Elasticsearch disabled
+
+elasticsearch:
+  enabled: false
+
+opensearch:
+  enabled: true
+  singleNode: true
+  config:
+    opensearch.yml: |
+      plugins:
+        security:
+          disabled: true
+  opensearchJavaOpts: "-Xms512m -Xmx512m"
+  resources:
+    requests:
+      cpu: 200m
+      memory: 768Mi
+    limits:
+      memory: 1500Mi
+  persistence:
+    enabled: true
+    size: 8Gi
+
+kafka:
+  enabled: true
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      memory: 1Gi
+  zookeeper:
+    replicaCount: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        memory: 512Mi
+
+mysql:
+  enabled: true
+  image:
+    repository: bitnamilegacy/mysql
+    tag: 8.0.40-debian-12-r5
+  auth:
+    existingSecret: mysql-secrets
+    database: datahub
+    username: datahub
+  primary:
+    extraFlags: "--character-set-server=utf8mb4 --collation-server=utf8mb4_bin"
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        memory: 512Mi
+    persistence:
+      enabled: false
+
+neo4j:
+  enabled: false

@@ -1,0 +1,57 @@
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: fraud
+  namespace: fraud-infra
+spec:
+  predictor:
+    containers:
+    - name: kserve-container
+      image: ancaotrinh/fraud-inference:latest 
+      imagePullPolicy: Always
+      ports:
+      - containerPort: 8080
+        protocol: TCP
+      readinessProbe:
+        httpGet:
+          path: /v2/health/ready
+          port: 8080
+        initialDelaySeconds: 30
+        periodSeconds: 10
+        failureThreshold: 10
+      livenessProbe:
+        httpGet:
+          path: /v2/health/live
+          port: 8080
+        initialDelaySeconds: 60
+        periodSeconds: 30
+      env:
+      - name: POSTGRES_PASSWORD
+        value: "fraud_pass"
+      - name: MINIO_ACCESS_KEY
+        value: "fraud_minio_user"
+      - name: MINIO_SECRET_KEY
+        value: "fraud_minio_pass"
+      - name: MLFLOW_TRACKING_URI
+        value: "http://mlflow.fraud-infra.svc.cluster.local:5000"
+      - name: MLFLOW_S3_ENDPOINT_URL
+        value: "http://fraud-minio.fraud-infra.svc.cluster.local:9000"
+      - name: AWS_ACCESS_KEY_ID
+        value: "fraud_minio_user"
+      - name: AWS_SECRET_ACCESS_KEY
+        value: "fraud_minio_pass"
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: "http://jaeger.fraud-infra.svc.cluster.local:4317"
+      - name: DISCORD_WEBHOOK_URL
+        valueFrom:
+          secretKeyRef:
+            name: fraud-pipeline-secret
+            key: DISCORD_WEBHOOK_URL
+            optional: true
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "512Mi"
+        limits:
+          cpu: "1"
+          memory: "1Gi"

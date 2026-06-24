@@ -1,0 +1,10 @@
+# Bitnami Kafka Helm chart — DEPRECATED
+#
+# Replaced by Strimzi operator (CNCF best practice).
+# Manifests: infra/k8s/kafka/kafka.yaml + kafka-topics.yaml
+#
+# Lý do chuyển:
+#   - Bitnami image registry migrated từ bitnami/kafka → bitnamicharts/kafka
+#     gây ErrImagePull trên Kind cluster
+#   - Strimzi là CNCF project, declarative qua CRD, production-grade
+#   - Không cần Helm, không phụ thuộc image registry của bên thứ 3

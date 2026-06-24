@@ -1,0 +1,158 @@
+# Jenkins RBAC — ClusterRole + ClusterRoleBinding
+#
+# ClusterRole là cần thiết vì pipeline quản lý nhiều namespace:
+#   airflow, fraud-infra, monitoring, datahub, knative-serving
+# và cần tạo namespace mới (kubectl create namespace).
+#
+# Apply:
+#   kubectl apply -f infra/k8s/jenkins-role.yaml
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: jenkins
+rules:
+
+  # ── Core workloads ────────────────────────────────────────────────────────
+  # Track A: rollout restart deployment/airflow-dag-processor, statefulset/airflow-worker
+  # Track B: get/patch inferenceservice pods
+  # Track C: kubectl wait pod, kubectl get pods
+  - apiGroups: ["", "apps"]
+    resources:
+      - pods
+      - pods/log
+      - pods/exec          # kubectl exec (airflow dags list)
+      - pods/portforward   # Track B smoke test
+      - deployments
+      - statefulsets
+      - replicasets
+      - daemonsets
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # ── Config & secrets ──────────────────────────────────────────────────────
+  # Track A: kubectl create configmap airflow-dags, fraud-pipeline-config
+  # Track C: kubectl apply fraud-pipeline-secret, mysql-secrets, datahub-mysql-secrets
+  - apiGroups: [""]
+    resources:
+      - configmaps
+      - secrets
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # ── Networking & services ─────────────────────────────────────────────────
+  # Helm charts (airflow, monitoring, datahub) create services, ingresses
+  - apiGroups: ["", "networking.k8s.io"]
+    resources:
+      - services
+      - endpoints
+      - ingresses
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # ── Namespaces ────────────────────────────────────────────────────────────
+  # Track C: kubectl create namespace airflow, fraud-infra, monitoring, datahub
+  - apiGroups: [""]
+    resources:
+      - namespaces
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+
+  # ── Storage ───────────────────────────────────────────────────────────────
+  # Helm charts (PostgreSQL, MinIO, DataHub) create PVCs
+  - apiGroups: [""]
+    resources:
+      - persistentvolumeclaims
+      - persistentvolumes
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # ── Service accounts ─────────────────────────────────────────────────────
+  # Helm charts create ServiceAccounts
+  - apiGroups: [""]
+    resources:
+      - serviceaccounts
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # ── Events ───────────────────────────────────────────────────────────────
+  # kubectl describe / helm debug
+  - apiGroups: [""]
+    resources:
+      - events
+    verbs: ["get", "list", "watch"]
+
+  # ── RBAC (Helm charts often create Roles/RoleBindings) ───────────────────
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources:
+      - roles
+      - rolebindings
+      - clusterroles
+      - clusterrolebindings
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # ── Batch (Airflow creates Jobs for task execution) ───────────────────────
+  - apiGroups: ["batch"]
+    resources:
+      - jobs
+      - cronjobs
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # ── Autoscaling ───────────────────────────────────────────────────────────
+  # kube-prometheus-stack, Airflow Helm charts create HPAs
+  - apiGroups: ["autoscaling"]
+    resources:
+      - horizontalpodautoscalers
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # ── Policy ───────────────────────────────────────────────────────────────
+  # Helm charts may create PodDisruptionBudgets
+  - apiGroups: ["policy"]
+    resources:
+      - poddisruptionbudgets
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # ── KServe InferenceService ───────────────────────────────────────────────
+  # Track B: kubectl patch/apply inferenceservice fraud -n fraud-infra
+  - apiGroups: ["serving.kserve.io"]
+    resources:
+      - inferenceservices
+      - servingruntimes
+      - clusterservingruntimes
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # ── Prometheus Operator CRDs ──────────────────────────────────────────────
+  # Track C: kubectl apply ServiceMonitor
+  # kube-prometheus-stack creates PrometheusRules, PodMonitors
+  - apiGroups: ["monitoring.coreos.com"]
+    resources:
+      - servicemonitors
+      - podmonitors
+      - prometheusrules
+      - alertmanagerconfigs
+      - prometheuses
+      - alertmanagers
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # ── Knative Serving (net-istio.yaml) ─────────────────────────────────────
+  # Track C: kubectl apply infra/k8s/net-istio.yaml
+  - apiGroups: ["networking.knative.dev", "autoscaling.knative.dev"]
+    resources:
+      - ingresses
+      - certificates
+      - serverlessservices
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # ── CRDs (Helm install/upgrade may check CRDs) ────────────────────────────
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources:
+      - customresourcedefinitions
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: jenkins
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: jenkins
+subjects:
+  - kind: ServiceAccount
+    name: default
+    namespace: jenkins

@@ -1,0 +1,42 @@
+# infra/helm/jaeger/values.yaml
+# Deploy with: helm install jaeger jaegertracing/jaeger -n fraud-infra -f values.yaml
+# Add repo:    helm repo add jaegertracing https://jaegertracing.github.io/helm-charts
+
+provisionDataStore:
+  cassandra: false
+  elasticsearch: false
+  kafka: false
+
+allInOne:
+  enabled: true
+  image:
+    repository: jaegertracing/all-in-one
+    tag: "1.58"
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  extraEnv:
+    - name: SPAN_STORAGE_TYPE
+      value: memory
+    - name: MEMORY_MAX_TRACES
+      value: "50000"
+
+collector:
+  enabled: false
+
+query:
+  enabled: false
+
+agent:
+  enabled: false
+
+storage:
+  type: memory
+
+service:
+  type: ClusterIP
